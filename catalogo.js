@@ -4114,6 +4114,12 @@ async function submitOrderPayload(payload, baseHeaders){
               return;
             }
 
+            saveCheckoutDraft({
+              order_id: String(orderId),
+              external_reference: String(orderId),
+              payment_status: 'mp_pending'
+            });
+
             const preferencePayload = {
               order_id: orderId,
               external_reference: String(orderId),
@@ -4149,10 +4155,17 @@ async function submitOrderPayload(payload, baseHeaders){
               if (location && location.protocol && location.protocol.startsWith('http') && location.origin) {
                 const returnPathRaw = String(location.pathname || '/catalogo').trim() || '/catalogo';
                 const returnPath = returnPathRaw.startsWith('/') ? returnPathRaw : ('/' + returnPathRaw);
+                const buildReturnUrl = (paymentState) => {
+                  const url = new URL(returnPath, location.origin);
+                  url.searchParams.set('payment', String(paymentState || ''));
+                  url.searchParams.set('order_id', String(orderId));
+                  url.searchParams.set('external_reference', String(orderId));
+                  return url.toString();
+                };
                 preferencePayload.back_urls = {
-                  success: location.origin + returnPath + '?payment=success',
-                  failure: location.origin + returnPath + '?payment=failure',
-                  pending: location.origin + returnPath + '?payment=pending'
+                  success: buildReturnUrl('success'),
+                  failure: buildReturnUrl('failure'),
+                  pending: buildReturnUrl('pending')
                 };
               }
             }catch(_){ }
@@ -4211,6 +4224,12 @@ async function submitOrderPayload(payload, baseHeaders){
             }
 
             if (pref && (pref.init_point || pref.sandbox_init_point)) {
+              saveCheckoutDraft({
+                order_id: String(orderId),
+                external_reference: String(orderId),
+                payment_reference: String(pref.preference_id || '').trim(),
+                payment_status: 'mp_pending'
+              });
               clearCart(); closeCart();
               const target = pref.init_point || pref.sandbox_init_point;
               window.location.href = target;
@@ -4685,10 +4704,66 @@ async function fetchOrdersSnapshot(token, { limit = 200, source = 'web' } = {}){
       const res = await fetch(url, { method: 'GET', headers, mode: 'cors', cache: 'no-store' });
       if (!res.ok) continue;
       const data = await res.json();
-      if (Array.isArray(data)) return data;
+      if (Array.isArray(data)) {
+        const repaired = await syncMercadoPagoOrdersSnapshot(token, data);
+        if (repaired) {
+          const refreshRes = await fetch(url, { method: 'GET', headers, mode: 'cors', cache: 'no-store' }).catch(() => null);
+          if (refreshRes && refreshRes.ok) {
+            const refreshData = await refreshRes.json().catch(() => null);
+            if (Array.isArray(refreshData)) return refreshData;
+          }
+        }
+        return data;
+      }
     }catch(_){ }
   }
   return [];
+}
+
+function shouldAttemptMercadoPagoOrderSync(order){
+  const paymentMethod = normalizePaymentMethodKey(order?.payment_method || '');
+  const paymentStatus = normalizePaymentStatusKey(order?.payment_status || '');
+  const lifecycleStatus = normalizeOrderLifecycleStatus(order?.status || '');
+  if (paymentMethod !== 'mercadopago') return false;
+  if (!['mp_pending', 'in_process'].includes(paymentStatus)) return false;
+  if (lifecycleStatus === 'cancelado') return false;
+  return true;
+}
+
+async function syncMercadoPagoOrdersSnapshot(token, rows){
+  try{
+    const candidates = (Array.isArray(rows) ? rows : [])
+      .filter((order) => shouldAttemptMercadoPagoOrderSync(order))
+      .sort((a, b) => {
+        const ta = new Date(a?.created_at || 0).getTime();
+        const tb = new Date(b?.created_at || 0).getTime();
+        return tb - ta;
+      })
+      .slice(0, 6);
+    if (!candidates.length) return false;
+    const results = await Promise.all(candidates.map((order) => {
+      const orderId = String(order?.id ?? '').trim();
+      const paymentReference = String(order?.payment_reference || '').trim();
+      return syncMercadoPagoReturnToBackend({
+        paymentId: /^\d+$/.test(paymentReference) ? paymentReference : '',
+        externalReference: orderId,
+        orderId,
+        paymentReference,
+        status: String(order?.payment_status || '').trim()
+      }, { authToken: token }).catch(() => null);
+    }));
+    return results.some((result, index) => {
+      if (!result || !result.updated) return false;
+      const previousOrder = candidates[index] || {};
+      const previousStatus = normalizePaymentStatusKey(previousOrder?.payment_status || '');
+      const nextStatus = normalizePaymentStatusKey(result?.payment_status || '');
+      const previousReference = String(previousOrder?.payment_reference || '').trim();
+      const nextReference = String(result?.payment_reference || '').trim();
+      return (nextStatus && nextStatus !== previousStatus) || (!!nextReference && nextReference !== previousReference);
+    });
+  }catch(_){
+    return false;
+  }
 }
 async function fetchOrdersForRepeat(token){
   return fetchOrdersSnapshot(token, { limit: 200, source: 'web' });
@@ -11005,16 +11080,24 @@ function openAccountModal(){
     showAlert('No se pudo abrir Mi cuenta en este momento.', 'warning');
   }
 }
-async function syncMercadoPagoReturnToBackend({ paymentId, externalReference, status }){
+async function syncMercadoPagoReturnToBackend({ paymentId, externalReference, orderId, paymentReference, status }, { authToken = null } = {}){
   try{
+    const safeOrderId = String(orderId || '').trim();
+    const safeExternalReference = String(externalReference || safeOrderId || '').trim();
+    const safePaymentReference = String(paymentReference || '').trim();
+    const safePaymentId = String(paymentId || (/^\d+$/.test(safePaymentReference) ? safePaymentReference : '') || '').trim();
     const body = {
-      payment_id: paymentId || null,
-      external_reference: externalReference || null,
+      payment_id: safePaymentId || null,
+      external_reference: safeExternalReference || null,
+      order_id: safeOrderId || null,
+      payment_reference: safePaymentReference || null,
       status: status || null
     };
-    const headers = { 'Content-Type': 'application/json' };
+    if (safeOrderId) body.metadata = Object.assign({}, body.metadata || {}, { order_id: safeOrderId });
+    if (safePaymentReference) body.metadata = Object.assign({}, body.metadata || {}, { payment_reference: safePaymentReference });
+    const headers = { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' };
     try{
-      const token = getToken();
+      const token = authToken || getToken();
       if (token) headers['Authorization'] = `Bearer ${token}`;
     }catch(_){ }
 
@@ -11043,11 +11126,14 @@ async function syncMercadoPagoReturnToBackend({ paymentId, externalReference, st
           body: JSON.stringify(body),
           mode: 'cors'
         }, 8000);
-        if (res && res.ok) return true;
+        if (res && res.ok) {
+          const data = await res.json().catch(() => null);
+          return data || { ok: true, updated: false };
+        }
       }catch(_){ }
     }
   }catch(_){ }
-  return false;
+  return null;
 }
 
 async function handleMercadoPagoReturn(){
@@ -11058,6 +11144,11 @@ async function handleMercadoPagoReturn(){
     const qpStatus = String(params.get('status') || params.get('collection_status') || '').trim().toLowerCase();
     const paymentId = String(params.get('payment_id') || '').trim();
     const externalRef = String(params.get('external_reference') || '').trim();
+    const orderIdFromUrl = String(params.get('order_id') || '').trim();
+    const draft = loadCheckoutDraft() || {};
+    const draftOrderId = String(draft.order_id || '').trim();
+    const orderId = orderIdFromUrl || draftOrderId;
+    const paymentReference = String(params.get('payment_reference') || draft.payment_reference || '').trim();
 
     let result = qpPayment;
     if (!result){
@@ -11065,7 +11156,7 @@ async function handleMercadoPagoReturn(){
       else if (qpStatus === 'pending' || qpStatus === 'in_process' || qpStatus === 'inprocess') result = 'pending';
       else if (qpStatus) result = 'failure';
     }
-    if (!result && !paymentId && !externalRef) return;
+    if (!result && !paymentId && !externalRef && !orderId) return;
 
     try{
       let syncStatus = qpStatus;
@@ -11074,12 +11165,14 @@ async function handleMercadoPagoReturn(){
         else if (result === 'failure') syncStatus = 'rejected';
         else if (result === 'pending') syncStatus = 'in_process';
       }
-      if (paymentId || externalRef || syncStatus) {
-        syncMercadoPagoReturnToBackend({
+      if (paymentId || externalRef || orderId || syncStatus) {
+        await syncMercadoPagoReturnToBackend({
           paymentId,
-          externalReference: externalRef,
+          externalReference: externalRef || orderId,
+          orderId,
+          paymentReference,
           status: syncStatus
-        }).catch(()=>{});
+        }).catch(() => null);
       }
     }catch(_){ }
 
