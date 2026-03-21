@@ -3303,7 +3303,8 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
       #cartDrawer .cart-empty{display:flex;flex-direction:column;align-items:center;gap:10px;padding:26px;text-align:center;color:var(--muted)}
       .cart-empty .ce-cta{margin-top:8px}
       .cart-item{display:flex;gap:16px;align-items:center;padding:16px;border-radius:14px;background:linear-gradient(180deg,rgba(255,255,255,0.98),rgba(250,250,250,0.98));border:1px solid rgba(0,0,0,0.04);margin-bottom:14px;box-shadow:0 8px 24px rgba(2,6,23,0.05)}
-      .ci-image img{width:112px;height:112px;border-radius:12px;object-fit:cover;box-shadow:0 8px 20px rgba(2,6,23,0.08)}
+      .ci-image{width:96px;height:96px;flex:0 0 96px;display:flex;align-items:center;justify-content:center;padding:8px;border-radius:14px;background:linear-gradient(180deg,#fff,#f7fafc);border:1px solid rgba(10,34,64,0.08);overflow:hidden}
+      .ci-image img{width:100%;height:100%;border-radius:10px;object-fit:contain;object-position:center;box-shadow:none;background:transparent}
       .ci-info{flex:1;display:flex;flex-direction:column;gap:10px;min-width:0}
       .ci-name{font-weight:800;color:var(--deep);font-size:15px;display:flex;align-items:baseline;flex-wrap:wrap;column-gap:8px;row-gap:4px}
       .ci-name-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.2}
@@ -3325,8 +3326,8 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
       #clearCart,#checkoutBtn{border-radius:12px;padding:10px 14px}
       #clearCart{background:transparent;border:1px solid rgba(0,0,0,0.06)}
       #checkoutBtn{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#fff;border:0}
-      @media(max-width:620px){ .ci-image img{width:88px;height:88px} }
-      @media(max-width:420px){ .ci-image img{width:66px;height:66px} }
+      @media(max-width:620px){ .ci-image{width:84px;height:84px;flex-basis:84px;padding:6px} }
+      @media(max-width:420px){ .ci-image{width:72px;height:72px;flex-basis:72px;padding:5px} }
       /* Mobile full-screen drawer overrides */
       @media(max-width:640px){
         #cartDrawer{ left:0 !important; right:0 !important; top:0 !important; bottom:0 !important; width:100% !important; height:100% !important; max-width:none !important; border-radius:0 !important; padding:18px !important }
@@ -3362,11 +3363,11 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
         #cartDrawer .cart-item .ci-sub{font-size:12px;line-height:1.3}
         #cartDrawer .cart-item .qty{flex:1;justify-content:center;min-width:0}
         #cartDrawer .cart-item .btn.remove{white-space:nowrap;padding:8px 10px}
-        #cartDrawer .ci-image img{width:84px;height:84px}
+        #cartDrawer .ci-image{width:84px;height:84px;flex-basis:84px;padding:6px}
       }
       @media(max-width:420px){
         #cartDrawer .cart-item{grid-template-columns:74px minmax(0,1fr)}
-        #cartDrawer .ci-image img{width:74px;height:74px}
+        #cartDrawer .ci-image{width:74px;height:74px;flex-basis:74px;padding:5px}
         #cartDrawer .cart-item .ci-controls{gap:8px}
         #cartDrawer .cart-item .btn.remove{font-size:13px;padding:8px 10px}
       }
@@ -3377,10 +3378,13 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
 
   let subtotal = 0; cart.forEach(item=>{
     const row = document.createElement('div'); row.className = 'cart-item'; row.dataset.pid = item.id; row.dataset.key = (item.key || getCartKey(item));
+    const prod = products.find(x => String(x.id ?? x._id) === String(item.id));
     const img = document.createElement('div'); img.className = 'ci-image';
+    const rawCartImage = item.meta?.image || prod?.imagen || prod?.image || prod?.image_url || PLACEHOLDER_IMAGE;
     const cartImg = buildResponsiveImageHtml({
-      src: item.meta?.image || PLACEHOLDER_IMAGE,
+      src: normalizeProductImageUrl(rawCartImage, { source: 'cache' }) || PLACEHOLDER_IMAGE,
       alt: item.meta?.name || '',
+      imgStyle: 'width:100%;height:100%;object-fit:contain;object-position:center;border-radius:10px;background:transparent',
       width: 84,
       height: 84,
       sizes: '84px',
@@ -3391,7 +3395,6 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
     const info = document.createElement('div'); info.className = 'ci-info';
 
     // prefer item.meta.price when provided; try to reconcile with current `consumos` (admin changes may occur after item entered)
-    const prod = products.find(x => String(x.id ?? x._id) === String(item.id));
     const productBase = prod ? (prod.precio ?? prod.price ?? 0) : (item.meta?.price ?? 0);
 
     // If a consumo config currently exists for this product, compute its discounted price and prefer that (this lets cart reflect admin changes even for pre-existing cart items)
@@ -4039,6 +4042,7 @@ async function submitOrderPayload(payload, baseHeaders){
           payload.delivery_timezone = deliverySchedulePreview.delivery_timezone || '';
           payload.delivery_cutoff_hour = deliverySchedulePreview.delivery_cutoff_hour;
         }catch(_){ }
+        payload.source = 'web';
         // If the cart includes consumo items, mark the payload but DO NOT prompt the customer
         try{
           const hasConsumos = Array.isArray(payload.items) && payload.items.some(i => {
@@ -4086,7 +4090,7 @@ async function submitOrderPayload(payload, baseHeaders){
 
       // Attach Authorization header when token present
       const authToken = getToken();
-      const baseHeaders = { 'Content-Type': 'application/json' };
+      const baseHeaders = { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' };
       if (authToken) baseHeaders['Authorization'] = `Bearer ${authToken}`;
       try{ console.debug('[checkout] authToken present?', !!authToken, authToken ? ('***'+authToken.slice(-10)) : null, 'headers', baseHeaders); }catch(_){ }
       const submitResult = await submitOrderPayload(payload, baseHeaders);
@@ -4351,7 +4355,7 @@ async function submitOrderPayload(payload, baseHeaders){
     }
 
     const authToken = getToken();
-    const baseHeaders = { 'Content-Type': 'application/json' };
+    const baseHeaders = { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' };
     if (authToken) baseHeaders['Authorization'] = `Bearer ${authToken}`;
     const submitResult = await submitOrderPayload(payload, baseHeaders);
     if (submitResult && submitResult.ok) {
@@ -4415,7 +4419,7 @@ async function submitOrderPayload(payload, baseHeaders){
       // Extract payloads and POST as array to /backup-orders (server will persist each)
       const payloads = list.map(r => buildSanitizedOrderPayload(r.payload));
       try{
-        const resp = await fetch((typeof API_ORIGIN === 'string' && API_ORIGIN) ? (API_ORIGIN + '/backup-orders') : '/backup-orders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payloads), mode: 'cors' });
+        const resp = await fetch((typeof API_ORIGIN === 'string' && API_ORIGIN) ? (API_ORIGIN + '/backup-orders') : '/backup-orders', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' }, body: JSON.stringify(payloads), mode: 'cors' });
         if(resp.ok){
           // remove local cache on success
           clearFailedOrders();
