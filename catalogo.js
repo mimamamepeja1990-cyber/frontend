@@ -5348,7 +5348,7 @@ function getOrderDeliveryScheduleMeta(order){
 }
 function canCustomerCancelOrder(order){
   const statusKey = normalizeOrderLifecycleStatus(order?.status || '');
-  return statusKey === 'recibido' || statusKey === 'visto';
+  return statusKey === 'recibido' || statusKey === 'visto' || statusKey === 'preparado';
 }
 function buildOrderCancelInfoHtml(order){
   const notices = [];
