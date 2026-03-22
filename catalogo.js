@@ -377,8 +377,7 @@ function formatQtyLabel(qty, unitType, meta){
 }
 
 function normalizeCustomerType(value){
-  const v = String(value || '').trim().toLowerCase();
-  return v === 'minorista' ? 'minorista' : 'mayorista';
+  return CUSTOMER_TYPE_DEFAULT;
 }
 
 function getStoredCustomerType(){
@@ -11468,6 +11467,7 @@ function applyCustomerType(value, opts = {}){
 }
 
 function initCustomerTypeSelection(){
+  applyCustomerType(CUSTOMER_TYPE_DEFAULT, { persist: true, rerender: false });
   const modal = document.getElementById('customerTypeModal');
   if (!modal) return;
   const buttons = modal.querySelectorAll('.customer-type-btn[data-customer-type]');
