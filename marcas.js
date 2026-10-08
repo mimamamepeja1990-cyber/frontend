@@ -1,9 +1,6 @@
 const API_URL = 'https://backend-0lcs.onrender.com';
 const API_ORIGIN = new URL(API_URL).origin;
 const PRODUCT_FETCH_LIMIT = 5000;
-const PRODUCTS_CACHE_KEY = 'catalog:products_cache_v1';
-const PRODUCTS_CACHE_TS_KEY = 'catalog:products_cache_ts';
-const PRODUCTS_CACHE_TTL_MS = 3 * 60 * 1000;
 
 let brandSearch = null;
 let brandGrid = null;
@@ -107,44 +104,10 @@ function buildLogoHtml(src, alt){
   const webp = src.replace(/\.(png|jpe?g)$/i, '.webp');
   const encodedWebp = webp.replace(/ /g, '%20');
   const encodedSrc = src.replace(/ /g, '%20');
-  const placeholder = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
-  return `<picture class="brand-card-logo"><source type="image/webp" data-defer-srcset="${encodedWebp}"><img src="${placeholder}" data-defer-src="${encodedSrc}" alt="${escapeHtml(alt)}" loading="lazy" decoding="async" width="160" height="100"></picture>`;
-}
-
-function readStoredTimestamp(key){
-  try{
-    const raw = Number(localStorage.getItem(key) || 0);
-    return Number.isFinite(raw) ? raw : 0;
-  }catch(_){ return 0; }
-}
-
-function isFreshTimestamp(ts, ttlMs){
-  const num = Number(ts || 0);
-  return Number.isFinite(num) && num > 0 && (Date.now() - num) < ttlMs;
-}
-
-function loadCachedProducts(){
-  try{
-    const raw = localStorage.getItem(PRODUCTS_CACHE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    const items = Array.isArray(parsed) ? parsed : [];
-    if (!items.length) return [];
-    if (!isFreshTimestamp(readStoredTimestamp(PRODUCTS_CACHE_TS_KEY), PRODUCTS_CACHE_TTL_MS)) return [];
-    return items;
-  }catch(_){ return []; }
-}
-
-function saveCachedProducts(items){
-  try{
-    localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(Array.isArray(items) ? items : []));
-    localStorage.setItem(PRODUCTS_CACHE_TS_KEY, String(Date.now()));
-  }catch(_){ }
+  return `<picture class="brand-card-logo"><source type="image/webp" srcset="${encodedWebp}"><img src="${encodedSrc}" alt="${escapeHtml(alt)}" loading="lazy" decoding="async" width="160" height="100"></picture>`;
 }
 
 async function fetchProducts(){
-  const cached = loadCachedProducts();
-  if (cached.length) return cached;
   const applyLimit = (url) => {
     try{
       if (!url) return url;
@@ -163,12 +126,12 @@ async function fetchProducts(){
   ];
   for (const url of tryUrls){
     try{
-      const res = await fetch(applyLimit(url));
+      const res = await fetch(applyLimit(url), { cache: 'no-store' });
       if (!res.ok) continue;
       const json = await res.json();
-      if (Array.isArray(json)) { saveCachedProducts(json); return json; }
-      if (json && Array.isArray(json.products)) { saveCachedProducts(json.products); return json.products; }
-      if (json && Array.isArray(json.data)) { saveCachedProducts(json.data); return json.data; }
+      if (Array.isArray(json)) return json;
+      if (json && Array.isArray(json.products)) return json.products;
+      if (json && Array.isArray(json.data)) return json.data;
     }catch(_){ }
   }
   return [];
@@ -245,7 +208,6 @@ function render(){
     frag.appendChild(card);
   });
   brandGrid.appendChild(frag);
-  try{ window.initDeferredImageHydration?.(brandGrid); }catch(_){ }
 }
 
 function init(){
