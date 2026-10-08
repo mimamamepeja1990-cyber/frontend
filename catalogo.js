@@ -11,6 +11,49 @@ const CHECKOUT_DRAFT_KEY = 'catalog:checkout_draft_v1';
 const CUSTOMER_TYPE_DEFAULT = 'mayorista';
 const IN_STOCK_ONLY_STORAGE_KEY = 'catalog:in_stock_only_v1';
 
+// Development-only request timing. Enable with ?debugCatalog=1 or
+// localStorage.setItem('catalog:debug', '1'). It logs endpoint paths/statuses,
+// never credentials, Authorization headers or response bodies.
+const CATALOG_DEBUG = (() => {
+  try {
+    return new URLSearchParams(window.location.search).has('debugCatalog') ||
+      localStorage.getItem('catalog:debug') === '1';
+  } catch (_) { return false; }
+})();
+const catalogStartupMetrics = {
+  startedAt: (typeof performance !== 'undefined' ? performance.now() : Date.now()),
+  requestCount: 0,
+};
+function catalogDebug(...args){
+  if (!CATALOG_DEBUG) return;
+  try { console.debug('[catalog-observability]', ...args); } catch (_) { }
+}
+function catalogSafePath(resource){
+  try { return new URL(String(resource), window.location.href).pathname; }
+  catch (_) { return String(resource || '').split('?')[0]; }
+}
+async function catalogObservedFetch(resource, options = {}, label = 'request'){
+  const started = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  catalogStartupMetrics.requestCount += 1;
+  const path = catalogSafePath(resource);
+  catalogDebug('request-start', { label, path, requestCount: catalogStartupMetrics.requestCount });
+  try {
+    const response = await fetch(resource, options);
+    catalogDebug('request-end', {
+      label, path, status: response.status,
+      durationMs: Number(((typeof performance !== 'undefined' ? performance.now() : Date.now()) - started).toFixed(1))
+    });
+    return response;
+  } catch (error) {
+    catalogDebug('request-error', {
+      label, path,
+      durationMs: Number(((typeof performance !== 'undefined' ? performance.now() : Date.now()) - started).toFixed(1)),
+      error: error && error.name ? error.name : 'Error'
+    });
+    throw error;
+  }
+}
+
 // DOM references will be initialized in `init()` to avoid race conditions
 let grid = null;
 let searchInput = null;
@@ -57,10 +100,9 @@ function detectLowEndCatalogMode(){
 }
 const lowEndCatalogMode = detectLowEndCatalogMode();
 const CATALOG_SEARCH_DELAY_MS = lowEndCatalogMode ? 160 : 90;
-const MAX_EAGER_PRODUCT_IMAGES = lowEndCatalogMode ? 1 : 2;
+const MAX_EAGER_PRODUCT_IMAGES = lowEndCatalogMode ? 2 : 6;
 const MIN_ANIMATE_GAP_MS = 1200;
 let lastAnimatedRender = 0;
-const DEFAULT_DEFERRED_IMAGE_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
 
 function applyCatalogPerformanceMode(){
   try{
@@ -75,32 +117,6 @@ function joinOriginPath(origin, path){
     const tail = String(path || '').replace(/^\/+/, '');
     return base + '/' + tail;
   }catch(_){ return String(path || ''); }
-}
-
-function normalizeProductImageUrl(image, { source = productsSource } = {}){
-  try{
-    const imgStr = String(image || '').trim();
-    if (!imgStr) return imgStr;
-    if (/^data:/i.test(imgStr) || /^https?:\/\//i.test(imgStr)) return imgStr;
-
-    const clean = imgStr.replace(/^\/+/, '');
-    const lastSegment = clean.split('/').pop() || '';
-    const hasFileExtension = /\.[a-z0-9]{2,5}(?:[?#].*)?$/i.test(lastSegment);
-    const isBackendUploadsPath = /^uploads\//i.test(clean);
-    const isBackendImageIdPath = /^images\/[^/?#]+(?:[?#].*)?$/i.test(clean) && !hasFileExtension;
-
-    // Product snapshots can come from local cache/products.json while still
-    // referencing backend-owned media such as `/images/{id}` or `/uploads/...`.
-    if ((isBackendUploadsPath || isBackendImageIdPath) && API_ORIGIN) {
-      return joinOriginPath(API_ORIGIN, clean);
-    }
-
-    if (source === 'api' && API_ORIGIN) return joinOriginPath(API_ORIGIN, clean);
-    if (imgStr.startsWith('/')) return imgStr;
-    return imgStr;
-  }catch(_){
-    return image;
-  }
 }
 
 function hideBackendWarningBanner(){
@@ -250,14 +266,7 @@ function buildSrcSet(src){
   return `${safe} 1x, ${safe} 2x`;
 }
 
-function getDeferredImagePlaceholder(){
-  try{
-    const candidate = String(window?.DEFERRED_IMAGE_PLACEHOLDER || '').trim();
-    return candidate || DEFAULT_DEFERRED_IMAGE_PLACEHOLDER;
-  }catch(_){ return DEFAULT_DEFERRED_IMAGE_PLACEHOLDER; }
-}
-
-function buildResponsiveImageHtml({ src, alt = '', pictureClass = '', imgClass = '', imgStyle = '', width = 320, height = 240, sizes = '', loading = 'lazy', fetchpriority = 'low', deferLoad = false } = {}){
+function buildResponsiveImageHtml({ src, alt = '', pictureClass = '', imgClass = '', imgStyle = '', width = 320, height = 240, sizes = '', loading = 'lazy', fetchpriority = 'low' } = {}){
   const safeSrc = escapeHtml(src || DEFAULT_FALLBACK_IMAGE);
   const safeAlt = escapeHtml(alt || '');
   const webp = toWebpUrl(src);
@@ -271,16 +280,6 @@ function buildResponsiveImageHtml({ src, alt = '', pictureClass = '', imgClass =
   const loadingAttr = loading ? ` loading="${loading}"` : '';
   const fetchAttr = fetchpriority ? ` fetchpriority="${fetchpriority}"` : '';
   const dimAttr = (width && height) ? ` width="${width}" height="${height}"` : '';
-  if (deferLoad){
-    const placeholder = escapeHtml(getDeferredImagePlaceholder());
-    const deferredSrcAttr = ` data-defer-src="${safeSrc}"`;
-    const deferredSrcsetAttr = srcset ? ` data-defer-srcset="${srcset}"` : '';
-    if (webp){
-      const sourceAttr = webpSrcset ? ` data-defer-srcset="${webpSrcset}"` : '';
-      return `<picture${pictureClassAttr}><source type="image/webp"${sourceAttr}${sizesAttr}><img${imgClassAttr}${imgStyleAttr} src="${placeholder}" alt="${safeAlt}"${deferredSrcAttr}${deferredSrcsetAttr}${loadingAttr} decoding="async"${fetchAttr}${sizesAttr}${dimAttr}></picture>`;
-    }
-    return `<img${imgClassAttr}${imgStyleAttr} src="${placeholder}" alt="${safeAlt}"${deferredSrcAttr}${deferredSrcsetAttr}${loadingAttr} decoding="async"${fetchAttr}${sizesAttr}${dimAttr}>`;
-  }
   if (webp){
     return `<picture${pictureClassAttr}><source type="image/webp" srcset="${webpSrcset}"${sizesAttr}><img${imgClassAttr}${imgStyleAttr} src="${safeSrc}" alt="${safeAlt}"${srcsetAttr}${loadingAttr} decoding="async"${fetchAttr}${sizesAttr}${dimAttr}></picture>`;
   }
@@ -377,7 +376,8 @@ function formatQtyLabel(qty, unitType, meta){
 }
 
 function normalizeCustomerType(value){
-  return CUSTOMER_TYPE_DEFAULT;
+  const v = String(value || '').trim().toLowerCase();
+  return v === 'minorista' ? 'minorista' : 'mayorista';
 }
 
 function getStoredCustomerType(){
@@ -478,19 +478,9 @@ function getDisplayPriceForCustomer(prod){
 let promotions = [];
 // consumos (admin-managed immediate-consumption discounts)
 let consumos = [];
-const LEAFLET_CSS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-const LEAFLET_JS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-let leafletAssetsPromise = null;
 const DEFAULT_FALLBACK_IMAGE = 'images/icon.png';
 const PLACEHOLDER_IMAGE = DEFAULT_FALLBACK_IMAGE;
-const PRODUCTS_CACHE_KEY = 'catalog:products_cache_v1';
-const PRODUCTS_CACHE_TS_KEY = 'catalog:products_cache_ts';
 const PROMOTIONS_CACHE_KEY = 'catalog:promotions_cache_v2';
-const CONSUMOS_CACHE_KEY = 'catalog:consumos_cache_v1';
-const CONSUMOS_CACHE_TS_KEY = 'catalog:consumos_cache_ts_v1';
-const PRODUCT_ENDPOINT_CACHE_KEY = 'catalog:products_endpoint_v1';
-const FILTERS_SYNC_TS_KEY = 'catalog:filters_sync_ts_v1';
-const PRODUCT_CATEGORIES_SYNC_TS_KEY = 'catalog:product_categories_sync_ts_v1';
 const DELIVERY_ADDRESS_CACHE_KEY = 'catalog:delivery_address_v1';
 const LOCATION_PREFILL_CACHE_KEY = 'catalog:location_prefill_v1';
 const LOCATION_PROMPT_SESSION_KEY = 'catalog:location_prompt_attempted_v1';
@@ -498,24 +488,9 @@ const ADDRESS_BOOK_STORAGE_PREFIX = 'catalog:address_book_v1:';
 const LAST_USED_ADDRESS_STORAGE_PREFIX = 'catalog:last_used_address_v1:';
 const REMOVED_ADDRESS_SIGNATURES_STORAGE_PREFIX = 'catalog:removed_address_signatures_v1:';
 const ADDRESS_BOOK_SYNC_DEBOUNCE_MS = 500;
-const PRODUCTS_CACHE_TTL_MS = 3 * 60 * 1000;
-const PROMOTIONS_CACHE_TTL_MS = 10 * 60 * 1000;
-const CONSUMOS_CACHE_TTL_MS = 5 * 60 * 1000;
-const FILTERS_SYNC_TTL_MS = 15 * 60 * 1000;
-const PRODUCT_CATEGORIES_SYNC_TTL_MS = 15 * 60 * 1000;
-const VISIBILITY_REVALIDATE_AFTER_MS = 3 * 60 * 1000;
-const REALTIME_REFRESH_DEBOUNCE_MS = 1200;
 let addressBookSyncTimer = null;
 let addressBookSyncPromise = null;
 let addressBookHydratePromise = null;
-let productsFetchPromise = null;
-let lastProductsFetchTs = 0;
-let lastPromotionsFetchTs = 0;
-let lastConsumosFetchTs = 0;
-let lastPassiveRevalidateTs = 0;
-let realtimeRefreshTimer = null;
-let realtimeRefreshNeedsProducts = false;
-let realtimeRefreshNeedsConsumos = false;
 const ALLOWED_ADDRESS_REGION = 'mendoza';
 const MENDOZA_BOUNDS = Object.freeze({
   minLat: -37.7,
@@ -643,169 +618,21 @@ function setAddressSearchMemoryCache(query, items){
   addressSearchMemoryCache.set(key, { ts: Date.now(), items: arr });
 }
 
-function readStoredTimestamp(key){
-  try{
-    const raw = Number(localStorage.getItem(key) || 0);
-    return Number.isFinite(raw) ? raw : 0;
-  }catch(_){ return 0; }
-}
-
-function writeStoredTimestamp(key, ts = Date.now()){
-  try{ localStorage.setItem(key, String(ts)); }catch(_){ }
-}
-
-function isFreshTimestamp(ts, ttlMs){
-  const num = Number(ts || 0);
-  return Number.isFinite(num) && num > 0 && (Date.now() - num) < ttlMs;
-}
-
-function loadCachedProducts(){
-  try{
-    const raw = localStorage.getItem(PRODUCTS_CACHE_KEY);
-    if (!raw) return { ts: 0, items: [] };
-    const parsed = JSON.parse(raw);
-    const items = Array.isArray(parsed) ? parsed : [];
-    return { ts: readStoredTimestamp(PRODUCTS_CACHE_TS_KEY), items };
-  }catch(_){ return { ts: 0, items: [] }; }
-}
-
-function saveCachedProducts(items){
-  try{
-    localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(Array.isArray(items) ? items : []));
-    writeStoredTimestamp(PRODUCTS_CACHE_TS_KEY);
-  }catch(_){ }
-}
-
-function loadCachedConsumos(){
-  try{
-    const raw = localStorage.getItem(CONSUMOS_CACHE_KEY);
-    if (!raw) return { ts: 0, items: [] };
-    const parsed = JSON.parse(raw);
-    const items = Array.isArray(parsed?.items) ? parsed.items : (Array.isArray(parsed) ? parsed : []);
-    const ts = Number(parsed?.ts || readStoredTimestamp(CONSUMOS_CACHE_TS_KEY) || 0);
-    return { ts: Number.isFinite(ts) ? ts : 0, items: Array.isArray(items) ? items : [] };
-  }catch(_){ return { ts: 0, items: [] }; }
-}
-
-function saveCachedConsumos(items){
-  try{
-    const normalized = Array.isArray(items) ? items : [];
-    const ts = Date.now();
-    localStorage.setItem(CONSUMOS_CACHE_KEY, JSON.stringify({ ts, items: normalized }));
-    writeStoredTimestamp(CONSUMOS_CACHE_TS_KEY, ts);
-  }catch(_){ }
-}
-
-function getPreferredProductsEndpoint(){
-  try{
-    return String(sessionStorage.getItem(PRODUCT_ENDPOINT_CACHE_KEY) || localStorage.getItem(PRODUCT_ENDPOINT_CACHE_KEY) || '').trim();
-  }catch(_){ return ''; }
-}
-
-function setPreferredProductsEndpoint(url){
-  const value = String(url || '').trim();
-  if (!value) return;
-  try{ sessionStorage.setItem(PRODUCT_ENDPOINT_CACHE_KEY, value); }catch(_){ }
-  try{ localStorage.setItem(PRODUCT_ENDPOINT_CACHE_KEY, value); }catch(_){ }
-}
-
-function schedulePassiveCatalogRevalidate(delay = 180){
-  if (document.visibilityState === 'hidden') return;
-  if (realtimeRefreshTimer) return;
-  realtimeRefreshTimer = setTimeout(async () => {
-    realtimeRefreshTimer = null;
-    if (document.visibilityState === 'hidden') return;
-    const now = Date.now();
-    const productsAreStale = !isFreshTimestamp(lastProductsFetchTs || readStoredTimestamp(PRODUCTS_CACHE_TS_KEY), VISIBILITY_REVALIDATE_AFTER_MS);
-    const needsProducts = realtimeRefreshNeedsProducts || productsAreStale;
-    const needsConsumos = realtimeRefreshNeedsConsumos;
-    realtimeRefreshNeedsProducts = false;
-    realtimeRefreshNeedsConsumos = false;
-    lastPassiveRevalidateTs = now;
-    try{
-      if (needsProducts){
-        await fetchProducts({ showSkeleton: false, force: true, reason: 'passive' });
-      }
-      if (needsConsumos && !needsProducts){
-        await fetchConsumos({ force: true });
-        render({ animate: true });
-      }
-    }catch(_){ }
-  }, Math.max(0, Number(delay || 0)));
-}
-
-function queueRealtimeCatalogRefresh({ products = false, consumosOnly = false } = {}){
-  if (products) realtimeRefreshNeedsProducts = true;
-  if (consumosOnly) realtimeRefreshNeedsConsumos = true;
-  schedulePassiveCatalogRevalidate(REALTIME_REFRESH_DEBOUNCE_MS);
-}
-
-function loadPromotionsCacheEntry(){
+function loadPromotionsCache(){
   try{
     const raw = localStorage.getItem(PROMOTIONS_CACHE_KEY);
-    if (!raw) return { ts: 0, items: [] };
+    if (!raw) return [];
     const parsed = JSON.parse(raw);
     const items = Array.isArray(parsed?.items) ? parsed.items : (Array.isArray(parsed) ? parsed : []);
-    const ts = Number(parsed?.ts || 0);
-    return { ts: Number.isFinite(ts) ? ts : 0, items: normalizePromotionsList(items) };
-  }catch(_){ return { ts: 0, items: [] }; }
-}
-
-function loadPromotionsCache(){
-  return loadPromotionsCacheEntry().items;
+    return normalizePromotionsList(items);
+  }catch(_){ return []; }
 }
 
 function savePromotionsCache(items){
   try{
     const normalized = normalizePromotionsList(Array.isArray(items) ? items : []);
-    const ts = Date.now();
-    localStorage.setItem(PROMOTIONS_CACHE_KEY, JSON.stringify({ ts, items: normalized }));
-    lastPromotionsFetchTs = ts;
+    localStorage.setItem(PROMOTIONS_CACHE_KEY, JSON.stringify({ ts: Date.now(), items: normalized }));
   }catch(_){ }
-}
-
-function normalizeInitBundlePayload(payload){
-  try{
-    if (!payload || typeof payload !== 'object') return null;
-    const productItems = Array.isArray(payload.products)
-      ? payload.products
-      : (Array.isArray(payload.data) ? payload.data : null);
-    if (!Array.isArray(productItems)) return null;
-    const promotionsItems = Array.isArray(payload.promotions)
-      ? payload.promotions
-      : (Array.isArray(payload.promociones) ? payload.promociones : []);
-    const consumosItems = Array.isArray(payload.consumos)
-      ? payload.consumos
-      : [];
-    return {
-      products: productItems,
-      promotions: promotionsItems,
-      consumos: consumosItems,
-    };
-  }catch(_){ return null; }
-}
-
-function applyInitBundlePayload(bundle){
-  if (!bundle || !Array.isArray(bundle.products)) return false;
-  const now = Date.now();
-  productsRaw = Array.isArray(bundle.products) ? bundle.products : [];
-  products = productsRaw.map(normalize);
-  saveCachedProducts(productsRaw);
-  lastProductsFetchTs = now;
-
-  if (Array.isArray(bundle.promotions)) {
-    promotions = normalizePromotionsList(bundle.promotions);
-    savePromotionsCache(promotions);
-    lastPromotionsFetchTs = now;
-  }
-
-  if (Array.isArray(bundle.consumos)) {
-    consumos = bundle.consumos;
-    saveCachedConsumos(consumos);
-    lastConsumosFetchTs = now;
-  }
-
-  return true;
 }
 
 function parsePromoDate(value){
@@ -894,68 +721,37 @@ function getConsumoType(c){
   return null;
 }
 
-async function fetchConsumos({ force = false } = {}){
-  const cached = loadCachedConsumos();
-  if (!force){
-    const memoryTs = lastConsumosFetchTs || cached.ts;
-    if (Array.isArray(consumos) && isFreshTimestamp(memoryTs, CONSUMOS_CACHE_TTL_MS)) return consumos;
-    if (isFreshTimestamp(cached.ts, CONSUMOS_CACHE_TTL_MS)) {
-      consumos = cached.items;
-      lastConsumosFetchTs = cached.ts;
-      return consumos;
-    }
-  }
-  const pageOrigin = (location && location.protocol && location.protocol.startsWith('http') && location.origin) ? location.origin : null;
-  const tryUrls = [];
-  if (typeof API_ORIGIN === 'string' && API_ORIGIN) {
-    tryUrls.push(`${API_ORIGIN}/api/consumos`, `${API_ORIGIN}/consumos`);
-  }
-  if (pageOrigin && pageOrigin === API_ORIGIN) {
-    tryUrls.push('/api/consumos', '/consumos');
-  }
-  tryUrls.push('consumos.json');
+async function fetchConsumos(){
+  const tryUrls = [
+    '/api/consumos',
+    '/consumos',
+    `${API_ORIGIN}/api/consumos`,
+    `${API_ORIGIN}/consumos`,
+    'consumos.json'
+  ];
   for (const url of tryUrls){
     try{
-      const res = await fetch(url);
-      if(!res.ok) continue;
+      const res = await catalogObservedFetch(url, { cache: 'no-store' }, 'consumos');
+      if(!res.ok){ catalogDebug('fallback', { label: 'consumos', path: catalogSafePath(url), status: res.status }); continue; }
       const data = await res.json();
       if (Array.isArray(data)) {
         consumos = data;
-        saveCachedConsumos(consumos);
-        lastConsumosFetchTs = Date.now();
         if (!String(url).includes('consumos.json')) markBackendOk();
         return consumos;
       }
       // tolerate wrapped responses
       if (data && Array.isArray(data.consumos)) {
         consumos = data.consumos;
-        saveCachedConsumos(consumos);
-        lastConsumosFetchTs = Date.now();
         if (!String(url).includes('consumos.json')) markBackendOk();
         return consumos;
       }
     }catch(e){ /* try next */ }
   }
-  if (cached.ts){
-    consumos = cached.items;
-    lastConsumosFetchTs = cached.ts;
-    return consumos;
-  }
   consumos = [];
   return consumos;
 }
 
-async function fetchPromotions({ force = false } = {}){
-  const cached = loadPromotionsCacheEntry();
-  if (!force){
-    const memoryTs = lastPromotionsFetchTs || cached.ts;
-    if (Array.isArray(promotions) && isFreshTimestamp(memoryTs, PROMOTIONS_CACHE_TTL_MS)) return promotions;
-    if (isFreshTimestamp(cached.ts, PROMOTIONS_CACHE_TTL_MS)) {
-      promotions = cached.items;
-      lastPromotionsFetchTs = cached.ts;
-      return promotions;
-    }
-  }
+async function fetchPromotions(){
   // Only use promotions endpoints (NOT /api/promos, which is promo images).
   // Prefer backend canonical source first.
   const tryUrls = [
@@ -969,8 +765,8 @@ async function fetchPromotions({ force = false } = {}){
     if (!url || seenUrls.has(url)) continue;
     seenUrls.add(url);
     try {
-      const res = await fetch(url, { mode: 'cors' });
-      if (!res.ok) continue;
+      const res = await catalogObservedFetch(url, { mode: 'cors', cache: 'no-store' }, 'promotions');
+      if (!res.ok){ catalogDebug('fallback', { label: 'promotions', path: catalogSafePath(url), status: res.status }); continue; }
       const contentType = String(res.headers.get('content-type') || '').toLowerCase();
       if (!contentType.includes('application/json')) continue;
       const data = await res.json();
@@ -986,16 +782,15 @@ async function fetchPromotions({ force = false } = {}){
       const normalized = normalizePromotionsList(list);
       promotions = normalized;
       savePromotionsCache(normalized);
-      lastPromotionsFetchTs = Date.now();
       markBackendOk();
       return promotions;
     } catch (err) { /* ignore and try next */ }
   }
 
   // fallback: use last known-good backend snapshot cache only
-  if (cached.ts){
-    promotions = cached.items;
-    lastPromotionsFetchTs = cached.ts;
+  const cached = loadPromotionsCache();
+  if (cached.length){
+    promotions = cached;
     return promotions;
   }
 
@@ -1051,81 +846,39 @@ function loadProductCategories(){
   try{ const raw = localStorage.getItem('admin_product_categories_v1') || '{}'; const parsed = JSON.parse(raw); return (parsed && typeof parsed === 'object') ? parsed : {}; }catch(e){ return {}; }
 }
 
-async function fetchAndSyncProductCategories({ force = false } = {}){
-  if (!force) {
-    const cached = loadProductCategories();
-    let cachedTs = readStoredTimestamp(PRODUCT_CATEGORIES_SYNC_TS_KEY);
-    if (!cachedTs && cached && Object.keys(cached).length){
-      cachedTs = Date.now();
-      writeStoredTimestamp(PRODUCT_CATEGORIES_SYNC_TS_KEY, cachedTs);
-    }
-    if (isFreshTimestamp(cachedTs, PRODUCT_CATEGORIES_SYNC_TTL_MS)) return cached;
-  }
+async function fetchAndSyncProductCategories(){
   const tryUrls = ['/product-categories.json', `/admin/product-categories.json`, `${API_ORIGIN}/product-categories.json`, `${API_ORIGIN}/product-categories`];
   for(const url of tryUrls){
     try{
       console.debug('[catalogo] fetchAndSyncProductCategories: trying', url);
-      const res = await fetch(url);
-      if(!res.ok){ console.debug('[catalogo] fetchAndSyncProductCategories: non-ok response from', url, res.status); continue; }
+      const res = await catalogObservedFetch(url, { cache: 'no-store' }, 'product-categories');
+      if(!res.ok){ console.debug('[catalogo] fetchAndSyncProductCategories: non-ok response from', url, res.status); catalogDebug('fallback', { label: 'product-categories', path: catalogSafePath(url), status: res.status }); continue; }
       const data = await res.json();
       if(data && typeof data === 'object'){
         try{ localStorage.setItem('admin_product_categories_v1', JSON.stringify(data)); }catch(e){ console.warn('[catalogo] fetchAndSyncProductCategories: failed to write localStorage', e); }
-        writeStoredTimestamp(PRODUCT_CATEGORIES_SYNC_TS_KEY);
         try{ render({ animate: true }); }catch(e){}
         console.log('[catalogo] fetched product-categories from', url);
-        return data;
+        return;
       } else {
         console.debug('[catalogo] fetchAndSyncProductCategories: no mapping at', url);
       }
     }catch(e){ console.debug('[catalogo] fetchAndSyncProductCategories: fetch error for', url, e); /* ignore and try next */ }
   }
   console.debug('[catalogo] fetchAndSyncProductCategories: no mapping found in any tryUrls');
-  return loadProductCategories();
-}
-
-let productCategoriesWarmupPromise = null;
-function maybeWarmProductCategoriesForFiltering({ force = false } = {}){
-  try{
-    const cached = loadProductCategories();
-    if (!force && cached && Object.keys(cached).length) return Promise.resolve(cached);
-    const active = loadActiveFilters();
-    const needsCategories = !!(force || (active && active.length) || (currentFilter && String(currentFilter).toLowerCase() !== 'all'));
-    if (!needsCategories) return Promise.resolve(cached || {});
-    if (productCategoriesWarmupPromise) return productCategoriesWarmupPromise;
-    productCategoriesWarmupPromise = fetchAndSyncProductCategories({ force }).then((data) => {
-      productCategoriesWarmupPromise = null;
-      try{ scheduleCatalogRender({ animate: true }); }catch(_){ }
-      return data;
-    }).catch((err) => {
-      productCategoriesWarmupPromise = null;
-      throw err;
-    });
-    return productCategoriesWarmupPromise;
-  }catch(_){ return Promise.resolve({}); }
 }
 
 // Try to fetch filters from common locations (so catalog shows them even when admin runs on a different origin)
-async function fetchAndSyncFilters({ force = false } = {}){
-  if (!force) {
-    const cached = loadAdminFilters();
-    let cachedTs = readStoredTimestamp(FILTERS_SYNC_TS_KEY);
-    if (!cachedTs && Array.isArray(cached) && cached.length){
-      cachedTs = Date.now();
-      writeStoredTimestamp(FILTERS_SYNC_TS_KEY, cachedTs);
-    }
-    if (isFreshTimestamp(cachedTs, FILTERS_SYNC_TTL_MS)) return cached;
-  }
+async function fetchAndSyncFilters(){
   const tryUrls = ['/filters.json','/admin/filters.json','/filters', `${API_ORIGIN}/filters.json`, `${API_ORIGIN}/filters`, `${API_ORIGIN}/admin/filters`];
   for(const url of tryUrls){
     try{
       console.debug('[catalogo] fetchAndSyncFilters: trying', url);
-      const res = await fetch(url);
-      if(!res.ok){ console.debug('[catalogo] fetchAndSyncFilters: non-ok response from', url, res.status); continue; }
+      const res = await catalogObservedFetch(url, { cache: 'no-store' }, 'filters');
+      if(!res.ok){ console.debug('[catalogo] fetchAndSyncFilters: non-ok response from', url, res.status); catalogDebug('fallback', { label: 'filters', path: catalogSafePath(url), status: res.status }); continue; }
       const data = await res.json();
       if(Array.isArray(data) && data.length){
         console.debug('[catalogo] fetchAndSyncFilters: got', data.length, 'filters from', url);
         try{ localStorage.setItem('admin_filters_v1', JSON.stringify(data)); }catch(e){ console.warn('[catalogo] fetchAndSyncFilters: failed to write localStorage', e); }
-        writeStoredTimestamp(FILTERS_SYNC_TS_KEY);
         try{ renderFilterButtons(); }catch(e){ console.warn('[catalogo] fetchAndSyncFilters: renderFilterButtons failed', e); }
         console.log('[catalogo] fetched filters from', url);
         return data;
@@ -1199,13 +952,7 @@ function renderFilterButtons(){
         const b = document.createElement('button');
         b.dataset.filter = f.value || String(f.name || '').toLowerCase();
         b.textContent = f.name || f.value;
-        b.addEventListener('click', ()=>{
-          currentFilter = b.dataset.filter;
-          scheduleCatalogRender({ animate: true });
-          if (currentFilter && currentFilter !== 'all') maybeWarmProductCategoriesForFiltering().catch(()=>null);
-          Array.from(container.querySelectorAll('button')).forEach(x=>x.classList.remove('active'));
-          b.classList.add('active');
-        });
+        b.addEventListener('click', ()=>{ currentFilter = b.dataset.filter; scheduleCatalogRender({ animate: true }); Array.from(container.querySelectorAll('button')).forEach(x=>x.classList.remove('active')); b.classList.add('active'); });
         // mark active if currentFilter matches
         const val = (b.dataset.filter || '').toLowerCase();
         if ((currentFilter && currentFilter.toLowerCase() === val)){ b.classList.add('active'); allBtn.classList.remove('active'); }
@@ -1344,16 +1091,10 @@ try{ if(typeof BroadcastChannel !== 'undefined'){ const bc2 = new BroadcastChann
 // Listen for direct localStorage changes from other tabs
 window.addEventListener('storage', (ev)=>{ if(ev.key === 'admin_filters_v1'){ try{ renderFilterButtons(); }catch(e){} } });
 
-// Warm metadata only when the user already depends on it.
-try{
-  const activeFilters = loadActiveFilters();
-  if (Array.isArray(activeFilters) && activeFilters.length && !loadAdminFilters().length){
-    fetchAndSyncFilters().catch(()=>null);
-  }
-  if ((Array.isArray(activeFilters) && activeFilters.length) || (currentFilter && currentFilter !== 'all')){
-    maybeWarmProductCategoriesForFiltering().catch(()=>null);
-  }
-}catch(_){}
+// Poll once at start and periodically as a fallback for cross-origin cases
+try{ fetchAndSyncFilters(); setInterval(fetchAndSyncFilters, 30000); }catch(e){}
+// Poll product-categories as well
+try{ fetchAndSyncProductCategories(); setInterval(fetchAndSyncProductCategories, 30000); }catch(e){}
 
 
 function getBestPromotionForProduct(product){
@@ -1653,9 +1394,35 @@ function normalize(p) {
   const price = pricing.selected;
   const saleUnit = getSaleUnitFromObj(p);
   let image = p.imagen || p.image || p.image_url || p.imageUrl || null;
+  // Si la ruta es relativa (empieza por '/') no anteponer el origen remoto cuando los
+  // datos proceden del `products.json` local — así los assets locales se resuelven correctamente
   if (image) {
+    // Normalize local uploads path so it resolves correctly when the page
+    // is served from `/frontend/` (dev server) or from site root.
+    // If image refers to uploads, prefer absolute root `/uploads/...` so it
+    // doesn't become relative to `/frontend/` and 404.
     try{
-      image = normalizeProductImageUrl(image, { source: productsSource });
+      const imgStr = String(image || '');
+      if (!imgStr) image = imgStr;
+      else if (/^data:/i.test(imgStr) || /^https?:\/\//i.test(imgStr)) {
+        image = imgStr;
+      } else {
+        const clean = imgStr.replace(/^\/+/, '');
+        if (/^uploads\//i.test(clean)) {
+          // uploads from API should point to API_ORIGIN; local assets keep root path
+          image = (productsSource === 'api' && API_ORIGIN)
+            ? joinOriginPath(API_ORIGIN, clean)
+            : '/' + clean;
+        } else if (productsSource === 'api' && API_ORIGIN) {
+          image = joinOriginPath(API_ORIGIN, clean);
+        } else if (imgStr.startsWith('/')) {
+          // keep absolute root as-is (will point to project root)
+          image = imgStr;
+        } else {
+          // leave as relative path for other assets
+          image = imgStr;
+        }
+      }
     }catch(e){ /* ignore normalization errors */ }
   }
   return {
@@ -1805,181 +1572,135 @@ function applyImageBackdrop(img){
   }catch(_){ }
 }
 
-async function fetchProducts({ showSkeleton = true, force = false, reason = 'manual' } = {}) {
-  if (productsFetchPromise) return productsFetchPromise;
-  productsFetchPromise = (async () => {
-    const cachedProducts = loadCachedProducts();
-    const memoryTs = lastProductsFetchTs || readStoredTimestamp(PRODUCTS_CACHE_TS_KEY);
-    const hasFreshMemory = Array.isArray(productsRaw) && productsRaw.length && isFreshTimestamp(memoryTs, PRODUCTS_CACHE_TTL_MS);
-    const hasFreshCache = cachedProducts.items.length && isFreshTimestamp(cachedProducts.ts, PRODUCTS_CACHE_TTL_MS);
-
-    if (!force && hasFreshMemory){
-      await Promise.all([fetchPromotions(), fetchConsumos()]);
-      syncCartPricesForCustomerType();
-      render({ animate: true });
-      updateLastUpdated(productsSource !== 'api');
-      return products;
+async function fetchProducts({ showSkeleton = true } = {}) {
+  const catalogLoadStarted = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const finishCatalogLoad = (source) => {
+    catalogDebug('catalog-load-end', {
+      source,
+      durationMs: Number(((typeof performance !== 'undefined' ? performance.now() : Date.now()) - catalogLoadStarted).toFixed(1)),
+      totalRequestsSincePageLoad: catalogStartupMetrics.requestCount
+    });
+  };
+  catalogDebug('catalog-load-start', { totalRequestsSincePageLoad: catalogStartupMetrics.requestCount });
+  if (showSkeleton) renderSkeleton();
+  // quick probe: avoid long waits trying remote API when backend is down
+  let backendLikelyUp = true;
+  try {
+    const probeUrl = (typeof API_ORIGIN === 'string' && API_ORIGIN) ? (API_ORIGIN + '/health') : '/health';
+    const pr = await fetchWithTimeout(probeUrl, {}, 1200, 'health').catch(()=>null);
+    backendLikelyUp = !!(pr && pr.ok);
+  } catch (e) { backendLikelyUp = false; }
+  // try multiple endpoints: prefer configured remote API when page is served from a different origin
+  // (avoid triggering many 404s when the frontend is hosted as static site on another host)
+  let tryUrls = [];
+  try {
+    const pageOrigin = (location && location.protocol && location.protocol.startsWith('http') && location.origin) ? location.origin : null;
+    const apiOrigin = (typeof API_URL === 'string' && API_URL) ? (new URL(API_URL)).origin : null;
+    // broaden attempted endpoints to common API paths (api, api/v1, spanish plural)
+    if (pageOrigin && apiOrigin && pageOrigin !== apiOrigin) {
+      if (backendLikelyUp) {
+        tryUrls = [
+          apiOrigin + '/products',
+          apiOrigin + '/api/products',
+          apiOrigin + '/api/v1/products',
+          apiOrigin + '/productos',
+          apiOrigin + '/api/productos',
+          pageOrigin + '/products',
+          '/products',
+          'products.json'
+        ];
+      } else {
+        // backend down - prefer same-origin and local copies
+        tryUrls = [ pageOrigin + '/products', '/products', 'products.json' ];
+      }
+    } else {
+      if (backendLikelyUp && apiOrigin) {
+        tryUrls = [ '/products', apiOrigin + '/products', apiOrigin + '/api/products', apiOrigin + '/api/v1/products', 'products.json' ];
+      } else {
+        tryUrls = [ '/products', 'products.json' ];
+      }
     }
+  } catch (e) {
+    tryUrls = ['/products', API_ORIGIN + '/products', API_ORIGIN + '/api/products', 'products.json'];
+  }
+  try{ console.debug('[catalogo] fetchProducts tryUrls:', tryUrls); }catch(_){ }
+  let data = null;
+  let used = null;
+  const applyLimit = (url) => {
+    try{
+      if (!url) return url;
+      if (!/\/(products|productos)(\?|$)/i.test(url)) return url;
+      if (url.includes('limit=')) return url;
+      const joiner = url.includes('?') ? '&' : '?';
+      return url + joiner + `skip=0&limit=${PRODUCT_FETCH_LIMIT}`;
+    }catch(_){ return url; }
+  };
+  for (const url of tryUrls) {
+    try {
+      const headers = {};
+      const token = getToken();
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const requestUrl = applyLimit(url);
+      const res = await catalogObservedFetch(requestUrl, { mode: 'cors', cache: 'no-store', headers }, 'products');
+      if (!res.ok){ catalogDebug('fallback', { label: 'products', path: catalogSafePath(requestUrl), status: res.status }); continue; }
+      const json = await res.json();
+      if (json && (Array.isArray(json) || Array.isArray(json.products) || Array.isArray(json.data))) {
+        data = Array.isArray(json) ? json : (json.products || json.data);
+        used = url;
+        break;
+      }
+    } catch (err) { /* try next */ }
+  }
 
-    if (!force && !productsRaw.length && hasFreshCache){
-      productsSource = 'cache';
-      productsRaw = cachedProducts.items;
+  if (!data) {
+    // try cached copy
+    try {
+      const cached = localStorage.getItem('catalog:products_cache_v1');
+      if (cached) {
+        const local = JSON.parse(cached);
+        productsRaw = Array.isArray(local) ? local : [];
+        products = productsRaw.map(normalize);
+        await Promise.all([fetchPromotions(), fetchConsumos()]);
+        syncCartPricesForCustomerType();
+        render({ animate: true });
+        showMessage('Mostrando catálogo desde caché local (offline).', 'info');
+        finishCatalogLoad('localStorage');
+        return;
+      }
+    } catch (cacheErr) { console.warn('cache read failed', cacheErr); }
+
+    showMessage('No se pudieron cargar productos desde el backend. Usando catálogo local si está disponible. ⚠️', 'warning');
+    markBackendFail();
+    try {
+      const local = await (await catalogObservedFetch('products.json', {}, 'products-local')).json();
+      productsSource = 'local';
+      productsRaw = Array.isArray(local) ? local : [];
       products = productsRaw.map(normalize);
-      lastProductsFetchTs = cachedProducts.ts;
       await Promise.all([fetchPromotions(), fetchConsumos()]);
       syncCartPricesForCustomerType();
       render({ animate: true });
       updateLastUpdated(true);
-      return products;
-    }
-
-    if (showSkeleton && !productsRaw.length) renderSkeleton();
-
-    let initTryUrls = [];
-    let tryUrls = [];
-    try {
-      const preferredUrl = getPreferredProductsEndpoint();
-      const pageOrigin = (location && location.protocol && location.protocol.startsWith('http') && location.origin) ? location.origin : null;
-      const apiOrigin = (typeof API_URL === 'string' && API_URL) ? (new URL(API_URL)).origin : null;
-      initTryUrls = [
-        apiOrigin ? (apiOrigin + '/init') : '',
-        (pageOrigin && apiOrigin && pageOrigin === apiOrigin) ? (pageOrigin + '/init') : ''
-      ].filter(Boolean);
-      tryUrls = [
-        preferredUrl,
-        apiOrigin ? (apiOrigin + '/products') : '',
-        apiOrigin ? (apiOrigin + '/api/products') : '',
-        apiOrigin ? (apiOrigin + '/api/v1/products') : '',
-        apiOrigin ? (apiOrigin + '/productos') : '',
-        pageOrigin ? (pageOrigin + '/products') : '',
-        '/products',
-        'products.json'
-      ].filter(Boolean);
+      finishCatalogLoad('products.json');
+      return;
     } catch (e) {
-      initTryUrls = [API_ORIGIN + '/init'];
-      tryUrls = ['/products', API_ORIGIN + '/products', API_ORIGIN + '/api/products', 'products.json'];
+      showMessage('No hay productos disponibles', 'error');
+      finishCatalogLoad('unavailable');
+      return;
     }
-
-    const seenInitUrls = new Set();
-    initTryUrls = initTryUrls.filter((url) => {
-      if (!url || seenInitUrls.has(url)) return false;
-      seenInitUrls.add(url);
-      return true;
-    });
-
-    const seenTryUrls = new Set();
-    tryUrls = tryUrls.filter((url) => {
-      if (!url || seenTryUrls.has(url)) return false;
-      seenTryUrls.add(url);
-      return true;
-    });
-    try{ console.debug('[catalogo] fetchProducts reason=%s initTryUrls=%o tryUrls=%o', reason, initTryUrls, tryUrls); }catch(_){ }
-
-    let data = null;
-    let used = null;
-    let usedInitBundle = null;
-    const applyLimit = (url) => {
-      try{
-        if (!url) return url;
-        if (!/\/(products|productos|init)(\?|$)/i.test(url)) return url;
-        if (url.includes('limit=')) return url;
-        const joiner = url.includes('?') ? '&' : '?';
-        return url + joiner + `skip=0&limit=${PRODUCT_FETCH_LIMIT}`;
-      }catch(_){ return url; }
-    };
-
-    for (const url of initTryUrls) {
-      try {
-        const headers = {};
-        const token = getToken();
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-        const res = await fetch(applyLimit(url), { mode: 'cors', headers });
-        if (!res.ok) continue;
-        const json = await res.json();
-        const bundle = normalizeInitBundlePayload(json);
-        if (!bundle) continue;
-        data = bundle.products;
-        used = url;
-        usedInitBundle = bundle;
-        break;
-      } catch (err) { /* try next */ }
-    }
-
-    if (!data) {
-      for (const url of tryUrls) {
-        try {
-          const headers = {};
-          const token = getToken();
-          if (token) headers['Authorization'] = `Bearer ${token}`;
-          const res = await fetch(applyLimit(url), { mode: 'cors', headers });
-          if (!res.ok) continue;
-          const json = await res.json();
-          if (json && (Array.isArray(json) || Array.isArray(json.products) || Array.isArray(json.data))) {
-            data = Array.isArray(json) ? json : (json.products || json.data);
-            used = url;
-            setPreferredProductsEndpoint(url);
-            break;
-          }
-        } catch (err) { /* try next */ }
-      }
-    }
-
-    if (!data) {
-      if (cachedProducts.items.length) {
-        productsSource = 'cache';
-        productsRaw = cachedProducts.items;
-        products = productsRaw.map(normalize);
-        lastProductsFetchTs = cachedProducts.ts;
-        await Promise.all([fetchPromotions(), fetchConsumos()]);
-        syncCartPricesForCustomerType();
-        render({ animate: true });
-        updateLastUpdated(true);
-        if (force) showMessage('Mostrando catálogo desde caché local mientras el backend responde.', 'info');
-        return products;
-      }
-
-      showMessage('No se pudieron cargar productos desde el backend. Usando catálogo local si está disponible. ⚠️', 'warning');
-      markBackendFail();
-      try {
-        const local = await (await fetch('products.json')).json();
-        productsSource = 'local';
-        productsRaw = Array.isArray(local) ? local : [];
-        products = productsRaw.map(normalize);
-        saveCachedProducts(productsRaw);
-        lastProductsFetchTs = Date.now();
-        await Promise.all([fetchPromotions(), fetchConsumos()]);
-        syncCartPricesForCustomerType();
-        render({ animate: true });
-        updateLastUpdated(true);
-        return products;
-      } catch (e) {
-        showMessage('No hay productos disponibles', 'error');
-        return [];
-      }
-    }
-
-    productsSource = (used === 'products.json') ? 'local' : 'api';
-    if (productsSource === 'api') markBackendOk();
-    else markBackendFail();
-    if (usedInitBundle) {
-      applyInitBundlePayload(usedInitBundle);
-    } else {
-      productsRaw = Array.isArray(data) ? data : [];
-      products = productsRaw.map(normalize);
-      saveCachedProducts(data);
-      lastProductsFetchTs = Date.now();
-      await Promise.all([fetchPromotions(), fetchConsumos()]);
-    }
-    syncCartPricesForCustomerType();
-    render({ animate: true });
-    updateLastUpdated(productsSource !== 'api');
-    return products;
-  })();
-  try{
-    return await productsFetchPromise;
-  }finally{
-    productsFetchPromise = null;
   }
+
+  // success
+  productsSource = (used === 'products.json') ? 'local' : 'api';
+  if (productsSource === 'api') markBackendOk();
+  else markBackendFail();
+  productsRaw = Array.isArray(data) ? data : [];
+  products = productsRaw.map(normalize);
+  try { localStorage.setItem('catalog:products_cache_v1', JSON.stringify(data)); localStorage.setItem('catalog:products_cache_ts', String(Date.now())); } catch (e) { /* ignore */ }
+  await Promise.all([fetchPromotions(), fetchConsumos()]);
+  syncCartPricesForCustomerType();
+  render({ animate: true });
+  updateLastUpdated();
+  finishCatalogLoad(productsSource);
 }
 
 // visual "fly to cart" effect
@@ -2166,8 +1887,7 @@ function render({ animate = false } = {}) {
             height: 200,
             sizes: '(max-width: 700px) 90vw, (max-width: 1100px) 45vw, 260px',
             loading: 'lazy',
-            fetchpriority: 'low',
-            deferLoad: true
+            fetchpriority: 'low'
           });
           const cType = getConsumoType(c);
           const rawLabel = (c.discount || c.value) ? (cType === 'percent' ? `-${Math.round(Number(c.discount || c.value))}%` : formatMoney(c.value || 0)) : 'Consumo';
@@ -2315,8 +2035,7 @@ function render({ animate = false } = {}) {
           height: 220,
           sizes: '120px',
           loading: 'lazy',
-          fetchpriority: 'low',
-          deferLoad: true
+          fetchpriority: 'low'
         });
         // compute readable promo label: support percent as fraction (0.12) or as whole number (12)
         let promoLabel = 'Oferta';
@@ -2365,7 +2084,6 @@ function render({ animate = false } = {}) {
     });
     // append promos into the promotionsRow (separate from product grid)
     promosRow.appendChild(promoFrag);
-    try{ window.initDeferredImageHydration?.(promosRow); }catch(_){ }
     try{
       const promotionsCountEl = document.getElementById('promotionsCount');
       if (promotionsCountEl) promotionsCountEl.textContent = ' ' + String(activePromotions.length) + ' activa' + (activePromotions.length === 1 ? '' : 's');
@@ -2396,8 +2114,7 @@ function render({ animate = false } = {}) {
       height: 320,
       sizes: '(max-width: 700px) 92vw, (max-width: 1100px) 45vw, 260px',
       loading: eagerImg ? 'eager' : 'lazy',
-      fetchpriority: eagerImg ? 'high' : 'low',
-      deferLoad: !eagerImg
+      fetchpriority: eagerImg ? 'high' : 'low'
     });
     const pid = String(p.id ?? p._id ?? p.nombre ?? i);
     const saleUnit = getSaleUnitFromObj(p);
@@ -2557,19 +2274,11 @@ function render({ animate = false } = {}) {
         img.dataset.tryCount = String(tries + 1);
         const srcRaw = String(img.getAttribute('src') || img.src || '');
         const cleaned = srcRaw.split('?')[0].split('#')[0];
-        const relativePath = cleaned.replace(/^https?:\/\/[^/]+/i, '').replace(/^\/+/, '');
         const name = cleaned ? cleaned.split('/').pop() : '';
         const apiOrigin = (typeof API_ORIGIN === 'string' && API_ORIGIN) ? API_ORIGIN : '';
-        const normalizedSrc = normalizeProductImageUrl(relativePath || cleaned, { source: 'api' });
-        // First retry: if the current path is a backend media route resolved against the
-        // wrong host, retry it against API_ORIGIN before falling back.
-        if (tries === 0 && normalizedSrc && normalizedSrc !== srcRaw) {
-          img.src = normalizedSrc;
-          return;
-        }
-        // Second retry: if we can infer an uploads filename, try API_ORIGIN/uploads/<name>
-        if (tries <= 1 && name) {
-          const candidate = apiOrigin
+        // First retry: if we can infer an uploads filename, try API_ORIGIN/uploads/<name>
+        if (tries === 0 && name) {
+          const candidate = (productsSource === 'api' && apiOrigin)
             ? joinOriginPath(apiOrigin, 'uploads/' + name)
             : ('uploads/' + name);
           if (candidate && candidate !== srcRaw) { img.src = candidate; return; }
@@ -2602,7 +2311,6 @@ function render({ animate = false } = {}) {
     frag.appendChild(card);
   });
   grid.appendChild(frag);
-  try{ window.initDeferredImageHydration?.(grid); }catch(_){ }
 
   // if animated, remove reveal class after animation to keep DOM clean
   if (animate && !reduceMotion) {
@@ -2802,7 +2510,6 @@ function updateCartBadge(){
 function setCatalogFilterFromEntry(filterValue = 'all'){
   try{
     currentFilter = String(filterValue || 'all').toLowerCase();
-    if (currentFilter && currentFilter !== 'all') maybeWarmProductCategoriesForFiltering().catch(()=>null);
     scheduleCatalogRender({ animate: true });
     const container = document.querySelector('.filters');
     if (container){
@@ -3302,8 +3009,7 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
       #cartDrawer .cart-empty{display:flex;flex-direction:column;align-items:center;gap:10px;padding:26px;text-align:center;color:var(--muted)}
       .cart-empty .ce-cta{margin-top:8px}
       .cart-item{display:flex;gap:16px;align-items:center;padding:16px;border-radius:14px;background:linear-gradient(180deg,rgba(255,255,255,0.98),rgba(250,250,250,0.98));border:1px solid rgba(0,0,0,0.04);margin-bottom:14px;box-shadow:0 8px 24px rgba(2,6,23,0.05)}
-      .ci-image{width:96px;height:96px;flex:0 0 96px;display:flex;align-items:center;justify-content:center;padding:8px;border-radius:14px;background:linear-gradient(180deg,#fff,#f7fafc);border:1px solid rgba(10,34,64,0.08);overflow:hidden}
-      .ci-image img{width:100%;height:100%;border-radius:10px;object-fit:contain;object-position:center;box-shadow:none;background:transparent}
+      .ci-image img{width:112px;height:112px;border-radius:12px;object-fit:cover;box-shadow:0 8px 20px rgba(2,6,23,0.08)}
       .ci-info{flex:1;display:flex;flex-direction:column;gap:10px;min-width:0}
       .ci-name{font-weight:800;color:var(--deep);font-size:15px;display:flex;align-items:baseline;flex-wrap:wrap;column-gap:8px;row-gap:4px}
       .ci-name-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.2}
@@ -3325,8 +3031,8 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
       #clearCart,#checkoutBtn{border-radius:12px;padding:10px 14px}
       #clearCart{background:transparent;border:1px solid rgba(0,0,0,0.06)}
       #checkoutBtn{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#fff;border:0}
-      @media(max-width:620px){ .ci-image{width:84px;height:84px;flex-basis:84px;padding:6px} }
-      @media(max-width:420px){ .ci-image{width:72px;height:72px;flex-basis:72px;padding:5px} }
+      @media(max-width:620px){ .ci-image img{width:88px;height:88px} }
+      @media(max-width:420px){ .ci-image img{width:66px;height:66px} }
       /* Mobile full-screen drawer overrides */
       @media(max-width:640px){
         #cartDrawer{ left:0 !important; right:0 !important; top:0 !important; bottom:0 !important; width:100% !important; height:100% !important; max-width:none !important; border-radius:0 !important; padding:18px !important }
@@ -3362,11 +3068,11 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
         #cartDrawer .cart-item .ci-sub{font-size:12px;line-height:1.3}
         #cartDrawer .cart-item .qty{flex:1;justify-content:center;min-width:0}
         #cartDrawer .cart-item .btn.remove{white-space:nowrap;padding:8px 10px}
-        #cartDrawer .ci-image{width:84px;height:84px;flex-basis:84px;padding:6px}
+        #cartDrawer .ci-image img{width:84px;height:84px}
       }
       @media(max-width:420px){
         #cartDrawer .cart-item{grid-template-columns:74px minmax(0,1fr)}
-        #cartDrawer .ci-image{width:74px;height:74px;flex-basis:74px;padding:5px}
+        #cartDrawer .ci-image img{width:74px;height:74px}
         #cartDrawer .cart-item .ci-controls{gap:8px}
         #cartDrawer .cart-item .btn.remove{font-size:13px;padding:8px 10px}
       }
@@ -3377,13 +3083,10 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
 
   let subtotal = 0; cart.forEach(item=>{
     const row = document.createElement('div'); row.className = 'cart-item'; row.dataset.pid = item.id; row.dataset.key = (item.key || getCartKey(item));
-    const prod = products.find(x => String(x.id ?? x._id) === String(item.id));
     const img = document.createElement('div'); img.className = 'ci-image';
-    const rawCartImage = item.meta?.image || prod?.imagen || prod?.image || prod?.image_url || PLACEHOLDER_IMAGE;
     const cartImg = buildResponsiveImageHtml({
-      src: normalizeProductImageUrl(rawCartImage, { source: 'cache' }) || PLACEHOLDER_IMAGE,
+      src: item.meta?.image || PLACEHOLDER_IMAGE,
       alt: item.meta?.name || '',
-      imgStyle: 'width:100%;height:100%;object-fit:contain;object-position:center;border-radius:10px;background:transparent',
       width: 84,
       height: 84,
       sizes: '84px',
@@ -3394,6 +3097,7 @@ function renderCart(){ const container = document.getElementById('cartItems'); c
     const info = document.createElement('div'); info.className = 'ci-info';
 
     // prefer item.meta.price when provided; try to reconcile with current `consumos` (admin changes may occur after item entered)
+    const prod = products.find(x => String(x.id ?? x._id) === String(item.id));
     const productBase = prod ? (prod.precio ?? prod.price ?? 0) : (item.meta?.price ?? 0);
 
     // If a consumo config currently exists for this product, compute its discounted price and prefer that (this lets cart reflect admin changes even for pre-existing cart items)
@@ -4041,7 +3745,6 @@ async function submitOrderPayload(payload, baseHeaders){
           payload.delivery_timezone = deliverySchedulePreview.delivery_timezone || '';
           payload.delivery_cutoff_hour = deliverySchedulePreview.delivery_cutoff_hour;
         }catch(_){ }
-        payload.source = 'web';
         // If the cart includes consumo items, mark the payload but DO NOT prompt the customer
         try{
           const hasConsumos = Array.isArray(payload.items) && payload.items.some(i => {
@@ -4089,7 +3792,7 @@ async function submitOrderPayload(payload, baseHeaders){
 
       // Attach Authorization header when token present
       const authToken = getToken();
-      const baseHeaders = { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' };
+      const baseHeaders = { 'Content-Type': 'application/json' };
       if (authToken) baseHeaders['Authorization'] = `Bearer ${authToken}`;
       try{ console.debug('[checkout] authToken present?', !!authToken, authToken ? ('***'+authToken.slice(-10)) : null, 'headers', baseHeaders); }catch(_){ }
       const submitResult = await submitOrderPayload(payload, baseHeaders);
@@ -4112,12 +3815,6 @@ async function submitOrderPayload(payload, baseHeaders){
               clearCheckoutDraft();
               return;
             }
-
-            saveCheckoutDraft({
-              order_id: String(orderId),
-              external_reference: String(orderId),
-              payment_status: 'mp_pending'
-            });
 
             const preferencePayload = {
               order_id: orderId,
@@ -4154,17 +3851,10 @@ async function submitOrderPayload(payload, baseHeaders){
               if (location && location.protocol && location.protocol.startsWith('http') && location.origin) {
                 const returnPathRaw = String(location.pathname || '/catalogo').trim() || '/catalogo';
                 const returnPath = returnPathRaw.startsWith('/') ? returnPathRaw : ('/' + returnPathRaw);
-                const buildReturnUrl = (paymentState) => {
-                  const url = new URL(returnPath, location.origin);
-                  url.searchParams.set('payment', String(paymentState || ''));
-                  url.searchParams.set('order_id', String(orderId));
-                  url.searchParams.set('external_reference', String(orderId));
-                  return url.toString();
-                };
                 preferencePayload.back_urls = {
-                  success: buildReturnUrl('success'),
-                  failure: buildReturnUrl('failure'),
-                  pending: buildReturnUrl('pending')
+                  success: location.origin + returnPath + '?payment=success',
+                  failure: location.origin + returnPath + '?payment=failure',
+                  pending: location.origin + returnPath + '?payment=pending'
                 };
               }
             }catch(_){ }
@@ -4223,12 +3913,6 @@ async function submitOrderPayload(payload, baseHeaders){
             }
 
             if (pref && (pref.init_point || pref.sandbox_init_point)) {
-              saveCheckoutDraft({
-                order_id: String(orderId),
-                external_reference: String(orderId),
-                payment_reference: String(pref.preference_id || '').trim(),
-                payment_status: 'mp_pending'
-              });
               clearCart(); closeCart();
               const target = pref.init_point || pref.sandbox_init_point;
               window.location.href = target;
@@ -4373,7 +4057,7 @@ async function submitOrderPayload(payload, baseHeaders){
     }
 
     const authToken = getToken();
-    const baseHeaders = { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' };
+    const baseHeaders = { 'Content-Type': 'application/json' };
     if (authToken) baseHeaders['Authorization'] = `Bearer ${authToken}`;
     const submitResult = await submitOrderPayload(payload, baseHeaders);
     if (submitResult && submitResult.ok) {
@@ -4419,7 +4103,7 @@ async function submitOrderPayload(payload, baseHeaders){
         clearFailedOrders();
         showToast(`Reintentos completados: ${successCount}`, 4000);
         // give server a moment then refresh to let admin see them
-        setTimeout(()=> fetchProducts({ showSkeleton: false, force: true, reason: 'retry-orders' }), 800);
+        setTimeout(()=> fetchProducts({ showSkeleton: false }), 800);
       } else {
         showToast('No se pudo enviar ninguno de los pedidos guardados', 4000);
       }
@@ -4437,12 +4121,12 @@ async function submitOrderPayload(payload, baseHeaders){
       // Extract payloads and POST as array to /backup-orders (server will persist each)
       const payloads = list.map(r => buildSanitizedOrderPayload(r.payload));
       try{
-        const resp = await fetch((typeof API_ORIGIN === 'string' && API_ORIGIN) ? (API_ORIGIN + '/backup-orders') : '/backup-orders', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' }, body: JSON.stringify(payloads), mode: 'cors' });
+        const resp = await fetch((typeof API_ORIGIN === 'string' && API_ORIGIN) ? (API_ORIGIN + '/backup-orders') : '/backup-orders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payloads), mode: 'cors' });
         if(resp.ok){
           // remove local cache on success
           clearFailedOrders();
           showToast('Pedidos guardados en el servidor', 3000);
-          setTimeout(()=> fetchProducts({ showSkeleton: false, force: true, reason: 'sync-backup-orders' }), 800);
+          setTimeout(()=> fetchProducts({ showSkeleton: false }), 800);
         } else {
           console.warn('syncFailedOrdersToServer: server rejected backup', resp.status);
         }
@@ -4504,11 +4188,10 @@ function startAutoRefresh() {
   if (countdownEl) countdownEl.textContent = String(countdown);
   // interval that performs refresh action          
   autoTimer = setInterval(() => {
-    if (document.visibilityState === 'hidden') return;
     if (mode === 'full') {
       location.reload();
     } else {
-      fetchProducts({ showSkeleton: false, force: true, reason: 'auto-refresh' });
+      fetchProducts({ showSkeleton: false });
     }
     countdown = AUTO_REFRESH_SECONDS;
   }, AUTO_REFRESH_SECONDS * 1000);
@@ -4546,10 +4229,24 @@ function updateLastUpdated(local = false) {
   // ensure UI reflects mode
   if (modeEl) modeEl.textContent = storedMode;
 
-  // If the toggle UI was removed, avoid silent polling.
+  // If the toggle UI was removed, keep auto-refresh running by default
   if (!toggle) {
-    stopAutoRefresh();
-    if (statusEl) statusEl.hidden = true;
+    const enabled = (storedEnabled === null) ? true : (storedEnabled === 'true');
+    if (statusEl) {
+      statusEl.classList.remove('on','off');
+      statusEl.classList.add(enabled ? 'on' : 'off');
+      statusEl.innerHTML = `<span class="dot"></span> ${enabled ? 'Activado' : 'Desactivado'}`;
+    }
+    if (enabled) startAutoRefresh();
+    // allow double-click on the mode label to toggle between 'soft' and 'full' modes
+    if (modeEl && modeEl.parentElement) {
+      modeEl.parentElement.addEventListener('dblclick', (ev) => {
+        const next = (localStorage.getItem('catalog:auto:mode') || 'soft') === 'soft' ? 'full' : 'soft';
+        localStorage.setItem('catalog:auto:mode', next);
+        modeEl.textContent = next;
+        if (localStorage.getItem('catalog:auto:enabled') !== 'false') startAutoRefresh();
+      });
+    }
     return;
   }
 
@@ -4629,6 +4326,8 @@ async function checkBackendConnectivity({ showToast = false } = {}){
 }
 
 // run a connectivity check after init
+document.addEventListener('DOMContentLoaded', ()=>{ try{ setTimeout(()=> checkBackendConnectivity({ showToast: true }), 2500); }catch(e){} });
+
 // wire clear button (if present)
 // small helper to avoid XSS when inserting strings into innerHTML
 // --- Auth helpers (login/register modal + token storage) ---
@@ -4703,66 +4402,10 @@ async function fetchOrdersSnapshot(token, { limit = 200, source = 'web' } = {}){
       const res = await fetch(url, { method: 'GET', headers, mode: 'cors', cache: 'no-store' });
       if (!res.ok) continue;
       const data = await res.json();
-      if (Array.isArray(data)) {
-        const repaired = await syncMercadoPagoOrdersSnapshot(token, data);
-        if (repaired) {
-          const refreshRes = await fetch(url, { method: 'GET', headers, mode: 'cors', cache: 'no-store' }).catch(() => null);
-          if (refreshRes && refreshRes.ok) {
-            const refreshData = await refreshRes.json().catch(() => null);
-            if (Array.isArray(refreshData)) return refreshData;
-          }
-        }
-        return data;
-      }
+      if (Array.isArray(data)) return data;
     }catch(_){ }
   }
   return [];
-}
-
-function shouldAttemptMercadoPagoOrderSync(order){
-  const paymentMethod = normalizePaymentMethodKey(order?.payment_method || '');
-  const paymentStatus = normalizePaymentStatusKey(order?.payment_status || '');
-  const lifecycleStatus = normalizeOrderLifecycleStatus(order?.status || '');
-  if (paymentMethod !== 'mercadopago') return false;
-  if (!['mp_pending', 'in_process'].includes(paymentStatus)) return false;
-  if (lifecycleStatus === 'cancelado') return false;
-  return true;
-}
-
-async function syncMercadoPagoOrdersSnapshot(token, rows){
-  try{
-    const candidates = (Array.isArray(rows) ? rows : [])
-      .filter((order) => shouldAttemptMercadoPagoOrderSync(order))
-      .sort((a, b) => {
-        const ta = new Date(a?.created_at || 0).getTime();
-        const tb = new Date(b?.created_at || 0).getTime();
-        return tb - ta;
-      })
-      .slice(0, 6);
-    if (!candidates.length) return false;
-    const results = await Promise.all(candidates.map((order) => {
-      const orderId = String(order?.id ?? '').trim();
-      const paymentReference = String(order?.payment_reference || '').trim();
-      return syncMercadoPagoReturnToBackend({
-        paymentId: /^\d+$/.test(paymentReference) ? paymentReference : '',
-        externalReference: orderId,
-        orderId,
-        paymentReference,
-        status: String(order?.payment_status || '').trim()
-      }, { authToken: token }).catch(() => null);
-    }));
-    return results.some((result, index) => {
-      if (!result || !result.updated) return false;
-      const previousOrder = candidates[index] || {};
-      const previousStatus = normalizePaymentStatusKey(previousOrder?.payment_status || '');
-      const nextStatus = normalizePaymentStatusKey(result?.payment_status || '');
-      const previousReference = String(previousOrder?.payment_reference || '').trim();
-      const nextReference = String(result?.payment_reference || '').trim();
-      return (nextStatus && nextStatus !== previousStatus) || (!!nextReference && nextReference !== previousReference);
-    });
-  }catch(_){
-    return false;
-  }
 }
 async function fetchOrdersForRepeat(token){
   return fetchOrdersSnapshot(token, { limit: 200, source: 'web' });
@@ -4817,13 +4460,39 @@ function initCatalogHeaderLogo(){
     const link = document.querySelector('.site-header .brand-logo');
     const img = document.getElementById('siteBrandLogo');
     if (!link || !img) return;
-    const onError = () => {
+
+    const fallbackSrcs = [
+      'images/distriar.png',
+      './images/distriar.png',
+      '/images/distriar.png',
+      '/catalogo/images/distriar.png',
+      'frontend/images/distriar.png',
+      '/frontend/images/distriar.png'
+    ];
+    let idx = 0;
+    const tried = new Set();
+
+    const tryNext = () => {
+      while (idx < fallbackSrcs.length) {
+        const next = String(fallbackSrcs[idx++] || '').trim();
+        if (!next || tried.has(next)) continue;
+        tried.add(next);
+        img.setAttribute('src', next);
+        return;
+      }
       link.classList.add('is-broken');
-      try{ img.removeAttribute('src'); }catch(_){ }
+      img.removeEventListener('error', onError);
     };
-    img.addEventListener('error', onError, { once: true });
+
+    const onError = () => { tryNext(); };
+    img.addEventListener('error', onError);
     img.addEventListener('load', () => { link.classList.remove('is-broken'); });
-    if (img.complete && !img.naturalWidth) onError();
+
+    const current = String(img.getAttribute('src') || '').trim();
+    if (current) tried.add(current);
+    if (img.complete && !img.naturalWidth) {
+      tryNext();
+    }
   }catch(_){ }
 }
 
@@ -5347,7 +5016,7 @@ function getOrderDeliveryScheduleMeta(order){
 }
 function canCustomerCancelOrder(order){
   const statusKey = normalizeOrderLifecycleStatus(order?.status || '');
-  return statusKey === 'recibido' || statusKey === 'visto' || statusKey === 'preparado';
+  return statusKey === 'recibido' || statusKey === 'visto';
 }
 function buildOrderCancelInfoHtml(order){
   const notices = [];
@@ -7631,61 +7300,6 @@ function hasLeafletForAuthLocation(){
   return typeof window !== 'undefined' && !!window.L && typeof window.L.map === 'function';
 }
 
-function ensureLeafletStylesheet(){
-  try{
-    const existing = document.querySelector(`link[href="${LEAFLET_CSS_URL}"]`);
-    if (existing) return Promise.resolve(true);
-    return new Promise((resolve, reject) => {
-      const link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = LEAFLET_CSS_URL;
-      link.crossOrigin = '';
-      link.onload = () => resolve(true);
-      link.onerror = () => reject(new Error('leaflet-css-load-failed'));
-      document.head.appendChild(link);
-    });
-  }catch(err){ return Promise.reject(err); }
-}
-
-function ensureLeafletScript(){
-  try{
-    if (hasLeafletForAuthLocation()) return Promise.resolve(true);
-    const existing = document.querySelector(`script[src="${LEAFLET_JS_URL}"]`);
-    if (existing) {
-      return new Promise((resolve, reject) => {
-        existing.addEventListener('load', () => resolve(true), { once: true });
-        existing.addEventListener('error', () => reject(new Error('leaflet-js-load-failed')), { once: true });
-      });
-    }
-    return new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = LEAFLET_JS_URL;
-      script.crossOrigin = '';
-      script.async = true;
-      script.onload = () => resolve(true);
-      script.onerror = () => reject(new Error('leaflet-js-load-failed'));
-      document.head.appendChild(script);
-    });
-  }catch(err){ return Promise.reject(err); }
-}
-
-function ensureLeafletForAuthLocation(){
-  if (hasLeafletForAuthLocation()) return Promise.resolve(true);
-  if (leafletAssetsPromise) return leafletAssetsPromise;
-  leafletAssetsPromise = (async () => {
-    try{
-      await ensureLeafletStylesheet();
-      await ensureLeafletScript();
-      return hasLeafletForAuthLocation();
-    }catch(err){
-      leafletAssetsPromise = null;
-      console.warn('Leaflet lazy-load failed', err);
-      return false;
-    }
-  })();
-  return leafletAssetsPromise;
-}
-
 function createLeafletPinIcon(className = '__map_pin'){
   try{
     if (!hasLeafletForAuthLocation()) return null;
@@ -9878,7 +9492,6 @@ function showAddressSearchModal({
 
 function showAddressMapConfirmModal(prefill, { title = 'Confirma tu dirección', seedPromise = null } = {}){
   return new Promise((resolve) => {
-    (async () => {
     try{
       const initial = normalizeAddressSuggestion(prefill) || normalizeLocationPrefill(prefill || {});
       const latLon = getAuthLocationLatLon(initial);
@@ -9959,7 +9572,6 @@ function showAddressMapConfirmModal(prefill, { title = 'Confirma tu dirección',
       };
       setAddressLabel(currentPrefill);
       setPrecisionHint(currentPrefill);
-      const leafletAvailable = await ensureLeafletForAuthLocation();
 
       const cleanupMap = () => {
         try{
@@ -10105,7 +9717,7 @@ function showAddressMapConfirmModal(prefill, { title = 'Confirma tu dirección',
         }catch(_){ }
       };
 
-      if (leafletAvailable && hasLeafletForAuthLocation() && mapCanvas){
+      if (hasLeafletForAuthLocation() && mapCanvas){
         const L = window.L;
         addressPickerMapInstance = L.map(mapCanvas, {
           zoomControl: true,
@@ -10240,10 +9852,6 @@ function showAddressMapConfirmModal(prefill, { title = 'Confirma tu dirección',
       console.error('showAddressMapConfirmModal failed', e);
       resolve(null);
     }
-    })().catch((e) => {
-      console.error('showAddressMapConfirmModal failed', e);
-      resolve(null);
-    });
   });
 }
 
@@ -11079,24 +10687,16 @@ function openAccountModal(){
     showAlert('No se pudo abrir Mi cuenta en este momento.', 'warning');
   }
 }
-async function syncMercadoPagoReturnToBackend({ paymentId, externalReference, orderId, paymentReference, status }, { authToken = null } = {}){
+async function syncMercadoPagoReturnToBackend({ paymentId, externalReference, status }){
   try{
-    const safeOrderId = String(orderId || '').trim();
-    const safeExternalReference = String(externalReference || safeOrderId || '').trim();
-    const safePaymentReference = String(paymentReference || '').trim();
-    const safePaymentId = String(paymentId || (/^\d+$/.test(safePaymentReference) ? safePaymentReference : '') || '').trim();
     const body = {
-      payment_id: safePaymentId || null,
-      external_reference: safeExternalReference || null,
-      order_id: safeOrderId || null,
-      payment_reference: safePaymentReference || null,
+      payment_id: paymentId || null,
+      external_reference: externalReference || null,
       status: status || null
     };
-    if (safeOrderId) body.metadata = Object.assign({}, body.metadata || {}, { order_id: safeOrderId });
-    if (safePaymentReference) body.metadata = Object.assign({}, body.metadata || {}, { payment_reference: safePaymentReference });
-    const headers = { 'Content-Type': 'application/json', 'X-Client-Platform': 'web', 'X-Source': 'web' };
+    const headers = { 'Content-Type': 'application/json' };
     try{
-      const token = authToken || getToken();
+      const token = getToken();
       if (token) headers['Authorization'] = `Bearer ${token}`;
     }catch(_){ }
 
@@ -11125,14 +10725,11 @@ async function syncMercadoPagoReturnToBackend({ paymentId, externalReference, or
           body: JSON.stringify(body),
           mode: 'cors'
         }, 8000);
-        if (res && res.ok) {
-          const data = await res.json().catch(() => null);
-          return data || { ok: true, updated: false };
-        }
+        if (res && res.ok) return true;
       }catch(_){ }
     }
   }catch(_){ }
-  return null;
+  return false;
 }
 
 async function handleMercadoPagoReturn(){
@@ -11143,11 +10740,6 @@ async function handleMercadoPagoReturn(){
     const qpStatus = String(params.get('status') || params.get('collection_status') || '').trim().toLowerCase();
     const paymentId = String(params.get('payment_id') || '').trim();
     const externalRef = String(params.get('external_reference') || '').trim();
-    const orderIdFromUrl = String(params.get('order_id') || '').trim();
-    const draft = loadCheckoutDraft() || {};
-    const draftOrderId = String(draft.order_id || '').trim();
-    const orderId = orderIdFromUrl || draftOrderId;
-    const paymentReference = String(params.get('payment_reference') || draft.payment_reference || '').trim();
 
     let result = qpPayment;
     if (!result){
@@ -11155,7 +10747,7 @@ async function handleMercadoPagoReturn(){
       else if (qpStatus === 'pending' || qpStatus === 'in_process' || qpStatus === 'inprocess') result = 'pending';
       else if (qpStatus) result = 'failure';
     }
-    if (!result && !paymentId && !externalRef && !orderId) return;
+    if (!result && !paymentId && !externalRef) return;
 
     try{
       let syncStatus = qpStatus;
@@ -11164,14 +10756,12 @@ async function handleMercadoPagoReturn(){
         else if (result === 'failure') syncStatus = 'rejected';
         else if (result === 'pending') syncStatus = 'in_process';
       }
-      if (paymentId || externalRef || orderId || syncStatus) {
-        await syncMercadoPagoReturnToBackend({
+      if (paymentId || externalRef || syncStatus) {
+        syncMercadoPagoReturnToBackend({
           paymentId,
-          externalReference: externalRef || orderId,
-          orderId,
-          paymentReference,
+          externalReference: externalRef,
           status: syncStatus
-        }).catch(() => null);
+        }).catch(()=>{});
       }
     }catch(_){ }
 
@@ -11203,12 +10793,14 @@ try{
 }catch(_){ }
 
 // Helper: fetch with AbortController-based timeout (used for auth requests)
-async function fetchWithTimeout(resource, options = {}, timeout = 10000){
+async function fetchWithTimeout(resource, options = {}, timeout = 10000, observabilityLabel = ''){
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
   options.signal = controller.signal;
   try{
-    return await fetch(resource, options);
+    return await (observabilityLabel
+      ? catalogObservedFetch(resource, options, observabilityLabel)
+      : fetch(resource, options));
   }finally{
     clearTimeout(id);
   }
@@ -11411,7 +11003,6 @@ function openAuthModal(options = {}){
   m.classList.add('open');
   m.setAttribute('aria-hidden','false');
   document.body.classList.add('modal-open');
-  try{ window.initDeferredImageHydration?.(m); }catch(_){ }
   const cachedLocation = authLocationPrefill || loadLocationPrefillCache();
   authLocationPrefill = cachedLocation || null;
   updateAuthLocationCard(authLocationPrefill, authLocationPrefill ? 'Ubicación guardada lista para usar.' : 'Si querés, usá tu ubicación actual o buscá tu dirección.');
@@ -11467,7 +11058,6 @@ function applyCustomerType(value, opts = {}){
 }
 
 function initCustomerTypeSelection(){
-  applyCustomerType(CUSTOMER_TYPE_DEFAULT, { persist: true, rerender: false });
   const modal = document.getElementById('customerTypeModal');
   if (!modal) return;
   const buttons = modal.querySelectorAll('.customer-type-btn[data-customer-type]');
@@ -11550,6 +11140,7 @@ const _origFetchProducts = typeof fetchProducts === 'function' ? fetchProducts :
 // browsers that load scripts early don't cause a hard error that stops rendering.
 function init(){
   try{
+    catalogDebug('catalog-init', { timestamp: new Date().toISOString() });
     applyCatalogPerformanceMode();
     grid = document.getElementById("catalogGrid") || (function(){ const s = document.createElement('section'); s.id='catalogGrid'; document.body.appendChild(s); return s;} )();
     // ensure there is a visible catalog title for clarity
@@ -11606,7 +11197,11 @@ function init(){
     }catch(e){ console.warn('brand filter init failed', e); }
 
     // initial load
-    try{ fetchProducts({ reason: 'init' }); }catch(e){ console.error('fetchProducts init failed', e); showMessage('No se pudieron cargar productos', 'error'); }
+    try{ fetchProducts(); }catch(e){ console.error('fetchProducts init failed', e); showMessage('No se pudieron cargar productos', 'error'); }
+    // ensure auto-refresh is enabled by default (unless explicitly disabled by the user)
+    if (localStorage.getItem('catalog:auto:enabled') === null) localStorage.setItem('catalog:auto:enabled','true');
+    // start auto-refresh if enabled
+    startAutoRefresh();
 
     if (searchInput) searchInput.addEventListener("input", () => { scheduleCatalogRender({ animate: true, delay: CATALOG_SEARCH_DELAY_MS }); });
 
@@ -11618,20 +11213,6 @@ function init(){
         try { searchInput.value = ''; searchInput.focus(); scheduleCatalogRender({ animate: true }); } catch (e) { console.error(e); }
       });
     }
-
-    window.addEventListener('focus', () => {
-      const lastRun = lastPassiveRevalidateTs || lastProductsFetchTs || readStoredTimestamp(PRODUCTS_CACHE_TS_KEY);
-      if (!isFreshTimestamp(lastRun, VISIBILITY_REVALIDATE_AFTER_MS)) schedulePassiveCatalogRevalidate(60);
-    });
-    window.addEventListener('online', () => { schedulePassiveCatalogRevalidate(60); });
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        const lastRun = lastPassiveRevalidateTs || lastProductsFetchTs || readStoredTimestamp(PRODUCTS_CACHE_TS_KEY);
-        if (!isFreshTimestamp(lastRun, VISIBILITY_REVALIDATE_AFTER_MS) || realtimeRefreshNeedsProducts || realtimeRefreshNeedsConsumos) {
-          schedulePassiveCatalogRevalidate(60);
-        }
-      }
-    });
   }catch(err){ console.error('init failed', err); }
 }
 
@@ -11687,15 +11268,15 @@ function connectProductWS(){
           if (!d || !d.action) return;
           // product updated: refresh products snapshot
           if (d.action === 'updated' && d.product && d.product.id){
-            queueRealtimeCatalogRefresh({ products: true });
+            fetchProducts({ showSkeleton: false }).catch(()=>{});
           }
           // consumos updated: refresh consumos
           else if (d.action === 'consumos-updated'){
-            queueRealtimeCatalogRefresh({ consumosOnly: true });
+            fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{});
           }
           // order created: may affect both stock and consumos
           else if (d.action === 'order_created'){
-            queueRealtimeCatalogRefresh({ products: true });
+            try{ fetchProducts({ showSkeleton: false }).catch(()=>{}); fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{}); }catch(_){ }
           }
         }catch(e){ console.warn('[catalogo] ws message parse failed', e); }
       };
@@ -11725,15 +11306,15 @@ function connectProductWS(){
           if (!d || !d.action) return;
           // product updated: refresh products snapshot
           if (d.action === 'updated' && d.product && d.product.id){
-            queueRealtimeCatalogRefresh({ products: true });
+            fetchProducts({ showSkeleton: false }).catch(()=>{});
           }
           // consumos updated: refresh consumos
           else if (d.action === 'consumos-updated'){
-            queueRealtimeCatalogRefresh({ consumosOnly: true });
+            fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{});
           }
           // order created: may affect both stock and consumos
           else if (d.action === 'order_created'){
-            queueRealtimeCatalogRefresh({ products: true });
+            try{ fetchProducts({ showSkeleton: false }).catch(()=>{}); fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{}); }catch(_){}
           }
         }catch(e){ console.warn('[catalogo] ws message parse failed', e); }
       };
