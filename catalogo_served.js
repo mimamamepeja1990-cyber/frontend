@@ -350,9 +350,9 @@ try{ if(typeof BroadcastChannel !== 'undefined'){ const bc2 = new BroadcastChann
 window.addEventListener('storage', (ev)=>{ if(ev.key === 'admin_filters_v1'){ try{ renderFilterButtons(); }catch(e){} } });
 
 // Poll once at start and periodically as a fallback for cross-origin cases
-try{ fetchAndSyncFilters(); setInterval(fetchAndSyncFilters, 30000); }catch(e){}
+try{ fetchAndSyncFilters(); }catch(e){}
 // Poll product-categories as well
-try{ fetchAndSyncProductCategories(); setInterval(fetchAndSyncProductCategories, 30000); }catch(e){}
+try{ fetchAndSyncProductCategories(); }catch(e){}
 
 
 function getBestPromotionForProduct(product){
@@ -1817,20 +1817,20 @@ function startAutoRefresh() {
   countdown = AUTO_REFRESH_SECONDS;
   if (countdownEl) countdownEl.textContent = String(countdown);
   // interval that performs refresh action          
-  autoTimer = setInterval(() => {
+  /* autoTimer = setInterval(() => {
     if (mode === 'full') {
       location.reload();
     } else {
       fetchProducts({ showSkeleton: false });
     }
     countdown = AUTO_REFRESH_SECONDS;
-  }, AUTO_REFRESH_SECONDS * 1000);
+  }, AUTO_REFRESH_SECONDS * 1000); */
   // tick every second for UI
-  countdownTimer = setInterval(() => {
+  /* countdownTimer = setInterval(() => {
     countdown -= 1;
     if (countdown <= 0) countdown = AUTO_REFRESH_SECONDS;
     if (countdownEl) countdownEl.textContent = String(countdown);
-  }, 1000);
+  }, 1000); */
 }
 
 function stopAutoRefresh() {

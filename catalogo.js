@@ -63,8 +63,9 @@ let brandFilterStatus = null;
 let brandFilterLabel = null;
 let clearBrandFilterBtn = null;
 
-// auto-refresh configuration (seconds)
-const AUTO_REFRESH_SECONDS = 30;
+// The initial HTTP snapshot is followed by WebSocket events.  The legacy
+// timer constants remain only for compatibility with old stored UI settings.
+const AUTO_REFRESH_SECONDS = 0;
 let products = [];
 let productsRaw = [];
 // indica si los productos fueron cargados desde el API remoto o desde el archivo local
@@ -1091,10 +1092,8 @@ try{ if(typeof BroadcastChannel !== 'undefined'){ const bc2 = new BroadcastChann
 // Listen for direct localStorage changes from other tabs
 window.addEventListener('storage', (ev)=>{ if(ev.key === 'admin_filters_v1'){ try{ renderFilterButtons(); }catch(e){} } });
 
-// Poll once at start and periodically as a fallback for cross-origin cases
-try{ fetchAndSyncFilters(); setInterval(fetchAndSyncFilters, 30000); }catch(e){}
-// Poll product-categories as well
-try{ fetchAndSyncProductCategories(); setInterval(fetchAndSyncProductCategories, 30000); }catch(e){}
+// Load configuration once. Subsequent changes arrive on the shared WebSocket.
+try{ fetchAndSyncFilters(); fetchAndSyncProductCategories(); }catch(e){}
 
 
 function getBestPromotionForProduct(product){
@@ -1600,6 +1599,7 @@ async function fetchProducts({ showSkeleton = true } = {}) {
     if (pageOrigin && apiOrigin && pageOrigin !== apiOrigin) {
       if (backendLikelyUp) {
         tryUrls = [
+          apiOrigin + '/init?skip=0&limit=' + PRODUCT_FETCH_LIMIT,
           apiOrigin + '/products',
           apiOrigin + '/api/products',
           apiOrigin + '/api/v1/products',
@@ -1615,17 +1615,19 @@ async function fetchProducts({ showSkeleton = true } = {}) {
       }
     } else {
       if (backendLikelyUp && apiOrigin) {
-        tryUrls = [ '/products', apiOrigin + '/products', apiOrigin + '/api/products', apiOrigin + '/api/v1/products', 'products.json' ];
+        tryUrls = [ '/init?skip=0&limit=' + PRODUCT_FETCH_LIMIT, '/products', apiOrigin + '/init?skip=0&limit=' + PRODUCT_FETCH_LIMIT, apiOrigin + '/products', apiOrigin + '/api/products', apiOrigin + '/api/v1/products', 'products.json' ];
       } else {
         tryUrls = [ '/products', 'products.json' ];
       }
     }
   } catch (e) {
-    tryUrls = ['/products', API_ORIGIN + '/products', API_ORIGIN + '/api/products', 'products.json'];
+    tryUrls = [API_ORIGIN + '/init?skip=0&limit=' + PRODUCT_FETCH_LIMIT, '/products', API_ORIGIN + '/products', API_ORIGIN + '/api/products', 'products.json'];
   }
   try{ console.debug('[catalogo] fetchProducts tryUrls:', tryUrls); }catch(_){ }
   let data = null;
   let used = null;
+  let bundledPromotions = null;
+  let bundledConsumos = null;
   const applyLimit = (url) => {
     try{
       if (!url) return url;
@@ -1643,10 +1645,14 @@ async function fetchProducts({ showSkeleton = true } = {}) {
       const requestUrl = applyLimit(url);
       const res = await catalogObservedFetch(requestUrl, { mode: 'cors', cache: 'no-store', headers }, 'products');
       if (!res.ok){ catalogDebug('fallback', { label: 'products', path: catalogSafePath(requestUrl), status: res.status }); continue; }
-      const json = await res.json();
-      if (json && (Array.isArray(json) || Array.isArray(json.products) || Array.isArray(json.data))) {
-        data = Array.isArray(json) ? json : (json.products || json.data);
-        used = url;
+        const json = await res.json();
+        if (json && (Array.isArray(json) || Array.isArray(json.products) || Array.isArray(json.data))) {
+          data = Array.isArray(json) ? json : (json.products || json.data);
+          if (json && !Array.isArray(json) && /\/init(?:\?|$)/i.test(requestUrl)) {
+            bundledPromotions = Array.isArray(json.promotions) ? normalizePromotionsList(json.promotions) : null;
+            bundledConsumos = Array.isArray(json.consumos) ? json.consumos : null;
+          }
+          used = url;
         break;
       }
     } catch (err) { /* try next */ }
@@ -1696,7 +1702,9 @@ async function fetchProducts({ showSkeleton = true } = {}) {
   productsRaw = Array.isArray(data) ? data : [];
   products = productsRaw.map(normalize);
   try { localStorage.setItem('catalog:products_cache_v1', JSON.stringify(data)); localStorage.setItem('catalog:products_cache_ts', String(Date.now())); } catch (e) { /* ignore */ }
-  await Promise.all([fetchPromotions(), fetchConsumos()]);
+  if (bundledPromotions !== null) promotions = bundledPromotions;
+  if (bundledConsumos !== null) consumos = bundledConsumos;
+  if (bundledPromotions === null || bundledConsumos === null) await Promise.all([fetchPromotions(), fetchConsumos()]);
   syncCartPricesForCustomerType();
   render({ animate: true });
   updateLastUpdated();
@@ -4175,32 +4183,10 @@ async function submitOrderPayload(payload, baseHeaders){
 // auto-refresh (soft by default: re-fetch; full = location.reload())
 function startAutoRefresh() {
   stopAutoRefresh();
-  const mode = localStorage.getItem('catalog:auto:mode') || 'soft';
-  const enabled = localStorage.getItem('catalog:auto:enabled') !== 'false';
   const countdownEl = document.getElementById('refreshCountdown');
   const modeEl = document.getElementById('autoMode');
-  if (modeEl) modeEl.textContent = mode;
-  if (!enabled) {
-    if (countdownEl) countdownEl.textContent = '—';
-    return;
-  }
-  countdown = AUTO_REFRESH_SECONDS;
-  if (countdownEl) countdownEl.textContent = String(countdown);
-  // interval that performs refresh action          
-  autoTimer = setInterval(() => {
-    if (mode === 'full') {
-      location.reload();
-    } else {
-      fetchProducts({ showSkeleton: false });
-    }
-    countdown = AUTO_REFRESH_SECONDS;
-  }, AUTO_REFRESH_SECONDS * 1000);
-  // tick every second for UI
-  countdownTimer = setInterval(() => {
-    countdown -= 1;
-    if (countdown <= 0) countdown = AUTO_REFRESH_SECONDS;
-    if (countdownEl) countdownEl.textContent = String(countdown);
-  }, 1000);
+  if (modeEl) modeEl.textContent = 'WebSocket';
+  if (countdownEl) countdownEl.textContent = 'WS';
 }
 
 function stopAutoRefresh() {
@@ -4229,7 +4215,7 @@ function updateLastUpdated(local = false) {
   // ensure UI reflects mode
   if (modeEl) modeEl.textContent = storedMode;
 
-  // If the toggle UI was removed, keep auto-refresh running by default
+  // The catalog is event-driven; keep the legacy control visible as status only.
   if (!toggle) {
     const enabled = (storedEnabled === null) ? true : (storedEnabled === 'true');
     if (statusEl) {
@@ -4237,14 +4223,14 @@ function updateLastUpdated(local = false) {
       statusEl.classList.add(enabled ? 'on' : 'off');
       statusEl.innerHTML = `<span class="dot"></span> ${enabled ? 'Activado' : 'Desactivado'}`;
     }
-    if (enabled) startAutoRefresh();
+    startAutoRefresh();
     // allow double-click on the mode label to toggle between 'soft' and 'full' modes
     if (modeEl && modeEl.parentElement) {
       modeEl.parentElement.addEventListener('dblclick', (ev) => {
         const next = (localStorage.getItem('catalog:auto:mode') || 'soft') === 'soft' ? 'full' : 'soft';
         localStorage.setItem('catalog:auto:mode', next);
         modeEl.textContent = next;
-        if (localStorage.getItem('catalog:auto:enabled') !== 'false') startAutoRefresh();
+        startAutoRefresh();
       });
     }
     return;
@@ -11239,9 +11225,72 @@ window.addEventListener('error', function(ev){ try{ showOverlayError('Error: '+(
 window.addEventListener('unhandledrejection', function(ev){ try{ showOverlayError('Promise rejection: '+(ev && ev.reason ? String(ev.reason) : String(ev))); }catch(e){} });
 
 // small helper to avoid XSS when inserting strings into innerHTML
-// WebSocket client: subscribe to product/consumos updates and refresh catalog in near-realtime
+// WebSocket client: the initial HTTP snapshot is followed by incremental events.
+let catalogLastEventSeq = 0;
+let catalogReconnectTimer = null;
+let catalogReconnectAttempt = 0;
+
+function applyRealtimeProduct(product){
+  if (!product || product.id == null) return false;
+  const id = String(product.id);
+  const index = products.findIndex((item) => String(item && item.id) === id);
+  if (index < 0) return false;
+  products[index] = { ...products[index], ...product };
+  if (productsRaw[index]) productsRaw[index] = { ...productsRaw[index], ...product };
+  try{ render({ animate: true }); }catch(_){ }
+  return true;
+}
+
+async function applyCatalogRealtimeEvent(d){
+  const action = String(d && d.action || '').toLowerCase();
+  const type = String(d && d.type || '').toLowerCase();
+  if (Number(d && d.seq) > catalogLastEventSeq) catalogLastEventSeq = Number(d.seq);
+  if (action === 'consumos-updated' || type === 'consumos.updated'){
+    await fetchConsumos();
+    try{ render({ animate: true }); }catch(_){ }
+    return;
+  }
+  if (action === 'filters-updated' || type === 'filters.updated'){
+    await fetchAndSyncFilters();
+    try{ renderFilterButtons(); }catch(_){ }
+    return;
+  }
+  if (action === 'product-categories-updated' || type === 'product_categories.updated'){
+    await fetchAndSyncProductCategories();
+    try{ render({ animate: true }); }catch(_){ }
+    return;
+  }
+  if (action === 'deleted' || type === 'product.deleted'){
+    const id = String((d.product && d.product.id) ?? d.id ?? '');
+    products = products.filter((item) => String(item && item.id) !== id);
+    productsRaw = productsRaw.filter((item) => String(item && item.id) !== id);
+    try{ render({ animate: true }); }catch(_){ }
+    return;
+  }
+  if (action === 'created' || action === 'updated' || type.indexOf('product.') === 0){
+    const product = d.product || (d.data && d.data.product);
+    if (action === 'created' || type === 'product.created'){
+      if (product && product.id != null && !products.some((item) => String(item && item.id) === String(product.id))){
+        productsRaw.push(product);
+        products.push(normalize(product));
+        try{ render({ animate: true }); }catch(_){ }
+        return;
+      }
+    }
+    if (!applyRealtimeProduct(product)) await fetchProducts({ showSkeleton: false });
+  }
+}
+
+function scheduleCatalogReconnect(){
+  if (catalogReconnectTimer) return;
+  catalogReconnectAttempt += 1;
+  const delay = Math.min(60000, Math.max(1000, Math.round(1000 * Math.pow(1.6, Math.min(catalogReconnectAttempt, 8))) + Math.round(Math.random() * 500)));
+  catalogReconnectTimer = setTimeout(() => { catalogReconnectTimer = null; connectProductWS(); }, delay);
+}
+
 function connectProductWS(){
   if (typeof WebSocket === 'undefined') return;
+  if (window.__catalogProductWs && [WebSocket.OPEN, WebSocket.CONNECTING].includes(window.__catalogProductWs.readyState)) return;
   let socket = null;
   let retries = 0;
   // Prefer API host when different from the page host (reduces WS errors on static hosting)
@@ -11257,75 +11306,48 @@ function connectProductWS(){
   let consecutiveFails = 0;
   function _connect(){
     try{
-      const wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
-      const host = hosts[hostIdx % hosts.length];
+      let wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
+      let host = hosts[hostIdx % hosts.length];
+      try{
+        const apiUrl = new URL(API_ORIGIN);
+        wsProtocol = apiUrl.protocol === 'https:' ? 'wss' : 'ws';
+        host = apiUrl.host;
+      }catch(_){ }
       const url = wsProtocol + '://' + host + '/ws/products';
       socket = new WebSocket(url);
-      socket.onopen = () => { retries = 0; consecutiveFails = 0; console.debug('[catalogo] WS connected to', url); };
+      window.__catalogProductWs = socket;
+      socket.onopen = () => {
+        retries = 0; consecutiveFails = 0; catalogReconnectAttempt = 0;
+        console.debug('[catalogo] WS connected to', url);
+        try{ socket.send(JSON.stringify({ scope: currentCustomerType || 'mayorista', topics: ['product', 'consumos', 'filters', 'product_categories'], since: catalogLastEventSeq })); }catch(_){ }
+        // A reconnect can miss events; recover only the catalog resources, not /init.
+        if (catalogLastEventSeq > 0){ fetchProducts({ showSkeleton: false }).catch(()=>{}); fetchConsumos().catch(()=>{}); }
+      };
       socket.onmessage = (ev) => {
         try{
           const d = JSON.parse(ev.data);
-          if (!d || !d.action) return;
-          // product updated: refresh products snapshot
-          if (d.action === 'updated' && d.product && d.product.id){
-            fetchProducts({ showSkeleton: false }).catch(()=>{});
-          }
-          // consumos updated: refresh consumos
-          else if (d.action === 'consumos-updated'){
-            fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{});
-          }
-          // order created: may affect both stock and consumos
-          else if (d.action === 'order_created'){
-            try{ fetchProducts({ showSkeleton: false }).catch(()=>{}); fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{}); }catch(_){ }
-          }
+          if (d) applyCatalogRealtimeEvent(d).catch(()=>{});
         }catch(e){ console.warn('[catalogo] ws message parse failed', e); }
       };
       socket.onclose = (ev) => {
+        if (window.__catalogProductWs === socket) window.__catalogProductWs = null;
         console.warn('[catalogo] WS closed for host', host, 'retrying...');
         consecutiveFails += 1;
         if (consecutiveFails >= 3 && hosts.length > 1) { hostIdx += 1; consecutiveFails = 0; console.warn('[catalogo] switching to next WS host'); }
         retries += 1;
         const delay = Math.min(60000, Math.max(1000, Math.round(1000 * Math.pow(1.5, retries))));
-        setTimeout(_connect, delay);
+        scheduleCatalogReconnect();
       };
-      socket.onerror = (e) => { console.warn('[catalogo] WS error for host', hosts[hostIdx % hosts.length], e); try{ socket.close(); }catch(_){ } };
-    }catch(e){ console.warn('[catalogo] ws connect failed', e); setTimeout(_connect, 3000); }
+      socket.onerror = (e) => { console.warn('[catalogo] WS error for host', host, e); try{ socket.close(); }catch(_){ } };
+    }catch(e){ console.warn('[catalogo] ws connect failed', e); scheduleCatalogReconnect(); }
   }
   // Skip inline fallback block; use host-rotation _connect() only
   _connect();
   return;
-    try{
-      const wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
-      let host = null;
-      try{ host = (new URL(API_ORIGIN)).host; }catch(e){ host = window.location.host; }
-      const url = wsProtocol + '://' + host + '/ws/products';
-      /* fallback WebSocket disabled - host-rotation _connect() used */
-      socket.onmessage = (ev) => {
-        try{
-          const d = JSON.parse(ev.data);
-          if (!d || !d.action) return;
-          // product updated: refresh products snapshot
-          if (d.action === 'updated' && d.product && d.product.id){
-            fetchProducts({ showSkeleton: false }).catch(()=>{});
-          }
-          // consumos updated: refresh consumos
-          else if (d.action === 'consumos-updated'){
-            fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{});
-          }
-          // order created: may affect both stock and consumos
-          else if (d.action === 'order_created'){
-            try{ fetchProducts({ showSkeleton: false }).catch(()=>{}); fetchConsumos().then(()=>{ try{ render({ animate: true }); }catch(_){} }).catch(()=>{}); }catch(_){}
-          }
-        }catch(e){ console.warn('[catalogo] ws message parse failed', e); }
-      };
-      socket.onclose = (ev) => { console.warn('[catalogo] WS closed, reconnecting...'); retries += 1; const delay = Math.min(60000, Math.max(1000, Math.round(1000 * Math.pow(1.5, retries)))); setTimeout(_connect, delay); };
-      socket.onerror = (e) => { console.warn('[catalogo] WS error', e); try{ socket.close(); }catch(_){ } };
-    }catch(e){ console.warn('[catalogo] ws connect failed', e); setTimeout(_connect, 3000); }
-  _connect();
 }
 
 // Start WS after init so API_ORIGIN is available and DOM is ready
-try{ if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ()=>{ setTimeout(()=>{ try{ connectProductWS(); }catch(_){} }, 900); }); else setTimeout(()=>{ try{ connectProductWS(); }catch(_){} }, 900); }catch(e){}
+try{ if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ()=>{ try{ connectProductWS(); }catch(_){} }); else connectProductWS(); }catch(e){}
 
 function parsePriceValue(v){
   if (v == null) return null;

@@ -8,7 +8,6 @@ document.addEventListener('DOMContentLoaded', function() {
 	let promoImages = [];
 	let current = 0;
 	let autoplayTimer = null;
-	let refreshTimer = null;
 
 	function renderIndicators(){
 		const container = carousel.parentElement.querySelector('.promo-indicators');
@@ -162,24 +161,28 @@ document.addEventListener('DOMContentLoaded', function() {
 	carousel.addEventListener('focusin', () => { stopAutoplay(); });
 	carousel.addEventListener('focusout', () => { startAutoplay(); });
 
-	// refrescar la lista cada 30s
-	function startRefresh(){
-		stopRefresh();
-		refreshTimer = setInterval(async () => {
-			const prevLen = promoImages.length;
-			await loadPromos();
-			// reiniciar autoplay si cambiÃ³ el nÃºmero de imÃ¡genes
-			if(promoImages.length !== prevLen){ startAutoplay(); }
-		}, 30000);
-	}
-	function stopRefresh(){ if(refreshTimer){ clearInterval(refreshTimer); refreshTimer = null; } }
-
-	// arrancar timers
+	// La carga inicial es HTTP; las modificaciones llegan por WebSocket.
 	startAutoplay();
-	startRefresh();
-
-	// limpiar al salir
-	window.addEventListener('beforeunload', () => { stopAutoplay(); stopRefresh(); });
+	function connectPromoWS(){
+		if (typeof WebSocket === 'undefined' || window.__distriarPromoWs) return;
+		let api = 'https://backend-0lcs.onrender.com';
+		try{ if (typeof API_ORIGIN === 'string' && API_ORIGIN) api = API_ORIGIN; }catch(_){ }
+		try{
+			const u = new URL(api);
+			const protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+			const socket = new WebSocket(`${protocol}//${u.host}/ws/products`);
+			window.__distriarPromoWs = socket;
+			socket.onmessage = (event) => {
+				try{
+					const data = JSON.parse(event.data);
+					if (data.type === 'promotions.updated' || data.action === 'promotions-updated') loadPromos().then(startAutoplay).catch(()=>{});
+				}catch(_){ }
+			};
+			socket.onclose = () => { window.__distriarPromoWs = null; };
+		}catch(_){ }
+	}
+	connectPromoWS();
+	window.addEventListener('beforeunload', () => { stopAutoplay(); try{ window.__distriarPromoWs?.close(); }catch(_){ } });
 });
 // Mobile menu toggle
 const menuToggle = document.querySelector('.menu-toggle');
